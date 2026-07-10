@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Respeta `UTE_RUNTIME_NAME` dentro del proceso Node para separar datos entre `UTE` y `UTE Dev`.
+
 ## 0.1.2
 
 - Muestra una pantalla de Login cuando el add-on todavía no tiene usuario y contraseña configurados.

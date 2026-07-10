@@ -4,6 +4,7 @@ set -euo pipefail
 
 APP_DIR=/app
 RUNTIME_NAME="${UTE_RUNTIME_NAME:-ute-dev}"
+export UTE_RUNTIME_NAME="${RUNTIME_NAME}"
 RUNTIME_ROOT="/data/${RUNTIME_NAME}"
 DATA_DIR="${RUNTIME_ROOT}/data"
 REPORT_DIR="${RUNTIME_ROOT}/reportes"

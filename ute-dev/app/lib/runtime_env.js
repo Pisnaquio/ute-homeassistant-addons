@@ -41,8 +41,9 @@ setEnvIfMissing('UTE_PASSWORD', addonOptions.ute_password);
 setEnvIfMissing('DEBUG', addonOptions.debug === true ? 'true' : null);
 setEnvIfMissing('TZ', addonOptions.timezone);
 
+const runtimeName = firstNonEmpty(process.env.UTE_RUNTIME_NAME, 'ute');
 const runtimeRoot = isAddonRuntime
-  ? path.join('/data', 'ute')
+  ? path.join('/data', runtimeName)
   : APP_ROOT;
 
 const runtimePaths = {
