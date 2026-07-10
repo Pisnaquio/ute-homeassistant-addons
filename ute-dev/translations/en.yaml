@@ -1,9 +1,0 @@
-configuration:
-  ute_email:
-    name: UTE email
-  ute_password:
-    name: UTE password
-  debug:
-    name: Debug logging
-  timezone:
-    name: Timezone

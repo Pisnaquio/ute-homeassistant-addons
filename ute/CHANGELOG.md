@@ -2,7 +2,7 @@
 
 ## 0.1.3
 
-- Respeta `UTE_RUNTIME_NAME` dentro del proceso Node para separar datos entre `UTE` y `UTE Dev`.
+- Respeta `UTE_RUNTIME_NAME` dentro del proceso Node para separar runtimes sin mezclar datos.
 
 ## 0.1.2
 
