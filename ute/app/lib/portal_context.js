@@ -140,9 +140,7 @@ async function discoverPortalContext(page, options = {}) {
     throw new Error('No se pudieron descubrir saId/spId desde el portal UTE');
   }
 
-  logger(`[Portal Context] saId=${context.saId} spId=${context.spId}` +
-    `${context.meterId ? ` meterId=${context.meterId}` : ''}` +
-    `${context.badge ? ' badge=ok' : ''}`);
+  logger('[Portal Context] service identifiers discovered');
 
   return context;
 }
