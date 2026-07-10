@@ -1,5 +1,5 @@
 name: "UTE"
-version: "0.1.1"
+version: "0.1.2"
 slug: "ute"
 description: "Dashboard y descarga de consumo UTE hosteados dentro de Home Assistant"
 url: "https://developers.home-assistant.io/docs/apps/"

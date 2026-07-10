@@ -20,6 +20,19 @@ const CONSUMO_PATH = path.join(runtimePaths.dataDir, 'consumo.json');
 const PERIOD_DETAIL_CACHE = new Map();
 const PERIOD_DETAILS_DIR = path.join(runtimePaths.dataDir, 'periodos_detalle');
 
+function hasConfiguredCredentials() {
+  return Boolean(process.env.UTE_EMAIL && process.env.UTE_PASSWORD);
+}
+
+function missingCredentialsPayload() {
+  return {
+    error: 'missing_credentials',
+    login_required: true,
+    message: 'Login requerido',
+    detail: 'Configurá ute_email y ute_password en las opciones del add-on.'
+  };
+}
+
 function loadHistorical() {
   try { return JSON.parse(fs.readFileSync(CONSUMO_PATH, 'utf8')); }
   catch(e) { return []; }
@@ -79,8 +92,20 @@ app.get('/api/data', (req, res) => {
   res.json(loadHistorical());
 });
 
+app.get('/api/config-status', (req, res) => {
+  const credentialsConfigured = hasConfiguredCredentials();
+  res.json({
+    credentials_configured: credentialsConfigured,
+    login_required: !credentialsConfigured
+  });
+});
+
 // Serves data/periodo_actual.json — written by `node ute_monitor.js current` (or download)
 app.get('/api/current', (req, res) => {
+  if (!hasConfiguredCredentials()) {
+    return res.status(428).json(missingCredentialsPayload());
+  }
+
   const data = loadPeriodoActual();
   if (!data) {
     return res.status(503).json({
@@ -134,6 +159,10 @@ app.get('/api/period-detail', (req, res) => {
 
 // Trigger full historical download (also updates periodo_actual.json)
 app.post('/api/refresh', (req, res) => {
+  if (!hasConfiguredCredentials()) {
+    return res.status(428).json(missingCredentialsPayload());
+  }
+
   try {
     spawnDetached(['download']);
     res.json({ message: 'Descarga completa iniciada en segundo plano' });
@@ -144,6 +173,10 @@ app.post('/api/refresh', (req, res) => {
 
 // Trigger lightweight current-period-only refresh (~1 min vs ~5 min for full download)
 app.post('/api/refresh-current', (req, res) => {
+  if (!hasConfiguredCredentials()) {
+    return res.status(428).json(missingCredentialsPayload());
+  }
+
   try {
     spawnDetached(['current']);
     res.json({ message: 'Actualización de período actual iniciada' });
@@ -179,6 +212,8 @@ app.get('/health', (_req, res) => {
 // ── Daily auto-refresh ────────────────────────────────────────────────────────
 // While the web server is running, check every hour and refresh if data is > 20h old
 setInterval(() => {
+  if (!hasConfiguredCredentials()) return;
+
   const data = loadPeriodoActual();
   const ageMs = data
     ? Date.now() - new Date(data.fetched_at).getTime()
@@ -265,6 +300,7 @@ const HTML = `<!DOCTYPE html>
   .btn { padding: 8px 18px; border-radius: 8px; border: none; cursor: pointer;
          font-size: .85rem; font-weight: 700; transition: all .2s; }
   .btn:hover { transform: translateY(-1px); }
+  .btn:disabled { opacity: .55; cursor: not-allowed; transform: none; }
   .btn-ghost { background: rgba(255,255,255,.12); color: #fff; border: 1px solid rgba(255,255,255,.12); }
   .btn-ghost:hover { background: rgba(255,255,255,.2); }
   .btn-primary {
@@ -669,6 +705,56 @@ const HTML = `<!DOCTYPE html>
     border-radius: 16px;
     background: linear-gradient(135deg, rgba(248,250,252,.92), rgba(239,246,255,.92));
   }
+  .login-card {
+    max-width: 560px;
+    margin: 0 auto;
+    padding: 28px;
+    text-align: left;
+    color: var(--text);
+    border: 1px solid rgba(26,86,219,.16);
+    border-radius: 22px;
+    background:
+      radial-gradient(circle at top right, rgba(26,86,219,.12), transparent 34%),
+      linear-gradient(180deg, rgba(255,255,255,.98), rgba(248,250,252,.96));
+    box-shadow: var(--shadow-card);
+  }
+  .login-eyebrow {
+    display: inline-flex;
+    margin-bottom: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--blue-light);
+    color: var(--blue);
+    font-size: .76rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+  }
+  .login-card h2 {
+    margin-bottom: 10px;
+    font-size: 1.35rem;
+  }
+  .login-card p {
+    color: var(--text-soft);
+    line-height: 1.55;
+    margin-bottom: 16px;
+  }
+  .login-card code {
+    padding: 2px 5px;
+    border-radius: 6px;
+    background: #eef2ff;
+    color: #1e3a8a;
+  }
+  .login-action {
+    padding: 9px 16px;
+    border: 0;
+    border-radius: 10px;
+    background: var(--blue);
+    color: #fff;
+    font-weight: 800;
+    cursor: pointer;
+    box-shadow: 0 10px 22px rgba(26,86,219,.18);
+  }
 
   @media (max-width: 860px) {
     header { margin: 12px 12px 0; padding: 18px 18px 16px; border-radius: 20px; }
@@ -689,8 +775,8 @@ const HTML = `<!DOCTYPE html>
   </div>
   <div class="header-right">
     <span id="refreshStatus"></span>
-    <button class="btn btn-ghost" onclick="refreshCurrent()">🔄 Actualizar período</button>
-    <button class="btn btn-primary" onclick="triggerDownload()">⬇ Descargar datos</button>
+    <button class="btn btn-ghost" id="refreshCurrentBtn" onclick="refreshCurrent()">🔄 Actualizar período</button>
+    <button class="btn btn-primary" id="downloadBtn" onclick="triggerDownload()">⬇ Descargar datos</button>
   </div>
 </header>
 
@@ -912,11 +998,76 @@ let ACTIVE_DAILY_PERIOD = 'current';
 let DAILY_DETAIL_CACHE = {};
 let dailyDetailRequestId = 0;
 let DAILY_PERIOD_INDEX = [];
+let CONFIG_STATUS = { credentials_configured: true, login_required: false };
 const URUGUAY_HOLIDAYS = ${JSON.stringify(URUGUAY_HOLIDAYS)};
 const URUGUAY_HOLIDAY_SET = new Set(URUGUAY_HOLIDAYS);
 
 const MONTHS = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
 const MONTHS_FULL = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+
+async function loadConfigStatus() {
+  try {
+    return await fetch('api/config-status').then(r => r.json());
+  } catch (e) {
+    return { credentials_configured: true, login_required: false };
+  }
+}
+
+function setLoginRequiredUi(required) {
+  const refreshBtn = document.getElementById('refreshCurrentBtn');
+  const downloadBtn = document.getElementById('downloadBtn');
+  if (refreshBtn) refreshBtn.disabled = required;
+  if (downloadBtn) downloadBtn.disabled = required;
+}
+
+function renderLoginRequired() {
+  setLoginRequiredUi(true);
+  document.getElementById('refreshStatus').textContent = 'Login requerido';
+  document.getElementById('kpiCurrent').innerHTML = '<span class="kpi-loading">Login</span>';
+  document.getElementById('kpiCurrentSub').textContent = 'Configurá el add-on';
+  document.getElementById('kpiCurrentTrend').innerHTML = '';
+  document.getElementById('kpiCurrentTooltipBody').innerHTML =
+    '<div class="tt-note">El add-on todavía no tiene usuario y contraseña de UTE.</div>';
+  document.getElementById('kpiEstCost').innerHTML = '<span class="kpi-loading">Login</span>';
+  document.getElementById('kpiEstSub').textContent = 'Configurá el add-on';
+  document.getElementById('kpiEstTrend').innerHTML = '';
+  document.getElementById('ttBody').textContent = 'Login requerido';
+  document.getElementById('ttNote').textContent = 'Guardá la configuración y reiniciá el add-on.';
+  document.getElementById('currentPeriod').textContent = 'Login requerido';
+  document.getElementById('cacheLabel').textContent = '';
+  document.getElementById('currentContent').className = 'current-loading';
+  document.getElementById('currentContent').innerHTML =
+    '<div class="login-card">' +
+      '<div class="login-eyebrow">Login</div>' +
+      '<h2>Conectá tu cuenta de UTE</h2>' +
+      '<p>Este add-on todavía no tiene un login configurado. Abrí la pestaña <b>Configuration</b> del add-on, cargá <code>ute_email</code> y <code>ute_password</code>, guardá y reiniciá el add-on.</p>' +
+      '<button class="login-action" onclick="checkLoginStatus()">Revisar estado</button>' +
+    '</div>';
+}
+
+async function ensureLoginReady() {
+  CONFIG_STATUS = await loadConfigStatus();
+  if (CONFIG_STATUS.login_required) {
+    renderLoginRequired();
+    return false;
+  }
+  setLoginRequiredUi(false);
+  return true;
+}
+
+async function checkLoginStatus() {
+  const s = document.getElementById('refreshStatus');
+  CONFIG_STATUS = await loadConfigStatus();
+  if (CONFIG_STATUS.login_required) {
+    renderLoginRequired();
+    s.textContent = 'Login pendiente';
+    return;
+  }
+  s.textContent = 'Login detectado, cargando…';
+  setLoginRequiredUi(false);
+  await loadCurrent();
+  setTimeout(() => { s.textContent = ''; }, 2500);
+}
 
 function parsePortalDate(text) {
   const [d, m, y] = String(text || '').split('-').map(Number);
@@ -1050,6 +1201,9 @@ function buildPreviousPeriodShadow(currentData, fallbackPrevRecord) {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
+  CONFIG_STATUS = await loadConfigStatus();
+  setLoginRequiredUi(Boolean(CONFIG_STATUS.login_required));
+
   const data = await fetch('api/data').then(r => r.json());
   DAILY_PERIOD_INDEX = await fetch('api/period-detail-index').then(r => r.json()).catch(() => []);
   HIST_DATA = data.sort((a,b) => a.año !== b.año ? a.año - b.año : a.mes - b.mes);
@@ -1058,6 +1212,10 @@ async function init() {
   populateFilterSelects();
   populateDailyPeriodSelect();
   applyFilter();
+  if (CONFIG_STATUS.login_required) {
+    renderLoginRequired();
+    return;
+  }
   loadCurrent();
 }
 
@@ -1077,6 +1235,12 @@ function populateFilterSelects() {
   const toSel   = document.getElementById('toMonth');
   fromSel.innerHTML = '<option value="">-</option>';
   toSel.innerHTML = '<option value="">-</option>';
+  if (ALL_DATA.length === 0) {
+    yearSel.value = currentYearVal;
+    fromSel.value = '';
+    toSel.value = '';
+    return;
+  }
   ALL_DATA.forEach(d => {
     const key = d.año + '-' + String(d.mes).padStart(2,'0');
     const label = MONTHS[d.mes-1] + ' ' + d.año + (d._provisional ? ' (prov.)' : '');
@@ -2000,7 +2164,15 @@ async function loadCurrent() {
   const currentTooltipBody = document.getElementById('kpiCurrentTooltipBody');
   const estTrend = document.getElementById('kpiEstTrend');
   try {
+    if (!(await ensureLoginReady())) return;
+
     const d = await fetch('api/current').then(r => r.json());
+    if (d.login_required) {
+      renderLoginRequired();
+      return;
+    }
+    if (d.error) throw new Error(d.error);
+
     DAILY_PERIOD_INDEX = await fetch('api/period-detail-index').then(r => r.json()).catch(() => DAILY_PERIOD_INDEX);
     CURRENT_DATA = d;
     DAILY_DETAIL_CACHE.current = d;
@@ -2008,8 +2180,6 @@ async function loadCurrent() {
     populateFilterSelects();
     populateDailyPeriodSelect();
     applyFilter();
-
-    if (d.error) throw new Error(d.error);
 
     document.getElementById('kpiCurrent').innerHTML =
       '<b>' + (d.consumo_kwh||0).toLocaleString('es-UY', {maximumFractionDigits:1}) + '</b>' +
@@ -2207,9 +2377,17 @@ async function loadCurrent() {
 // ─── Actions ──────────────────────────────────────────────────────────────────
 async function triggerDownload() {
   const s = document.getElementById('refreshStatus');
+  if (!(await ensureLoginReady())) return;
+
   s.textContent = 'Iniciando descarga completa…';
   try {
-    await fetch('api/refresh', { method: 'POST' });
+    const response = await fetch('api/refresh', { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (body.login_required) {
+      renderLoginRequired();
+      return;
+    }
+    if (!response.ok) throw new Error(body.error || 'No se pudo iniciar la descarga');
     s.textContent = 'Descarga iniciada ✓ (puede tardar ~5 min)';
     setTimeout(() => { s.textContent = ''; }, 8000);
   } catch(e) {
@@ -2219,6 +2397,7 @@ async function triggerDownload() {
 
 async function refreshCurrent() {
   const s = document.getElementById('refreshStatus');
+  if (!(await ensureLoginReady())) return;
 
   // Capture current fetched_at before triggering refresh
   const before   = await fetch('api/current').then(r => r.json()).catch(() => null);
@@ -2226,7 +2405,13 @@ async function refreshCurrent() {
 
   s.innerHTML = 'Actualizando <span class="spinner"></span>';
   try {
-    await fetch('api/refresh-current', { method: 'POST' });
+    const response = await fetch('api/refresh-current', { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (body.login_required) {
+      renderLoginRequired();
+      return;
+    }
+    if (!response.ok) throw new Error(body.error || 'No se pudo iniciar la actualización');
   } catch(e) {
     s.textContent = 'Error: ' + e.message;
     return;
