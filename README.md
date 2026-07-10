@@ -5,7 +5,8 @@ Repositorio dedicado de Home Assistant para instalar el addon `UTE`.
 Este repo contiene:
 
 - `repository.yaml` para que Home Assistant lo reconozca como custom addon repository
-- `ute/` con el addon listo para instalar
+- `ute/` con el canal estable listo para instalar
+- `ute-dev/` con un canal de pruebas instalable en paralelo
 
 El addon levanta una UI local dentro de Home Assistant y descarga datos del
 portal de UTE usando Playwright dentro del contenedor del propio addon.
@@ -19,7 +20,8 @@ No necesita instalar Node, Playwright ni Chromium manualmente.
 
 ## Estructura
 
-- `ute/`: addon local listo para copiar
+- `ute/`: add-on estable, aparece como `UTE`
+- `ute-dev/`: add-on de pruebas, aparece como `UTE Dev`
 - `repository.yaml`: metadata del repo de addons
 
 ## Instalacion recomendada
@@ -38,6 +40,13 @@ la instancia destino.
    - `ute_password`
 6. Iniciar el addon y abrir `UTE` desde la sidebar.
 
+## Canal de pruebas
+
+`UTE Dev` existe para probar cambios, cuentas distintas y escenarios nuevos sin
+tocar la instalacion estable. Usa otro slug (`ute-dev`) y otro almacenamiento
+persistente (`/data/ute-dev`), por lo que sus credenciales y datos quedan
+separados de `UTE`.
+
 ## Estado recomendado del repo
 
 Mientras siga pendiente la validacion con cuentas ajenas y una instancia limpia
@@ -51,6 +60,7 @@ publico.
 
 1. Descargar o descomprimir este repo.
 2. Copiar `ute/` a `addons/local/ute` en la instancia destino.
+   Para el canal de pruebas, copiar `ute-dev/` a `addons/local/ute-dev`.
 3. Refrescar la tienda de addons/apps.
 4. Instalar `UTE`.
 
@@ -59,6 +69,7 @@ publico.
 Despues de instalar:
 
 - la UI de `UTE` deberia abrir dentro de Home Assistant
+- `UTE Dev` puede instalarse en paralelo para pruebas
 - al primer arranque no se incluyen datos historicos precargados en el paquete compartible
 - `Refrescar periodo actual` deberia responder sin error
 - `Descargar datos` deberia completar el historial una vez configuradas las credenciales
