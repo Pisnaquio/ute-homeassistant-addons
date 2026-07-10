@@ -1,0 +1,29 @@
+name: "UTE"
+version: "0.1.1"
+slug: "ute"
+description: "Dashboard y descarga de consumo UTE hosteados dentro de Home Assistant"
+url: "https://developers.home-assistant.io/docs/apps/"
+startup: "application"
+boot: "auto"
+init: false
+arch:
+  - aarch64
+  - amd64
+ingress: true
+ingress_port: 3000
+ingress_stream: true
+ingress_panel: true
+panel_title: "UTE"
+panel_icon: "mdi:flash"
+panel_admin: false
+watchdog: "http://[HOST]:[PORT:3000]/health"
+options:
+  ute_email: ""
+  ute_password: ""
+  debug: false
+  timezone: "America/Montevideo"
+schema:
+  ute_email: "str?"
+  ute_password: "password?"
+  debug: "bool"
+  timezone: "str"
