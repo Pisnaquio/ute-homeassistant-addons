@@ -8,7 +8,6 @@
     "dashboard": "PORT=3010 node web.js",
     "download": "node ute_monitor.js download",
     "analyze": "node ute_monitor.js analyze",
-    "report": "node ute_monitor.js report",
     "schedule": "node ute_monitor.js schedule",
     "status": "node ute_monitor.js status",
     "help": "node ute_monitor.js help",
@@ -25,11 +24,13 @@
   "license": "MIT",
   "dependencies": {
     "chalk": "^4.1.2",
+    "chart.js": "^4.5.1",
     "cli-table3": "^0.6.3",
     "dotenv": "^16.3.1",
     "express": "^5.2.1",
     "fs-extra": "^11.2.0",
     "node-schedule": "^2.1.1",
+    "pdf-parse": "^2.4.5",
     "playwright": "^1.40.0",
     "xlsx": "^0.18.5"
   },

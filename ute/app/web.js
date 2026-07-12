@@ -8,6 +8,9 @@ const { loadPeriodDetail, savePeriodDetail } = require('./lib/period_detail_stor
 const { URUGUAY_HOLIDAYS } = require('./lib/uruguay_holidays');
 const { ensureRuntimeDirs, runtimePaths } = require('./lib/runtime_env');
 const { buildDisplayContext } = require('./lib/portal_context');
+const { SyncManager } = require('./lib/sync_manager');
+const { logEvent } = require('./lib/safe_log');
+const CHART_BUNDLE = path.join(path.dirname(require.resolve('chart.js')), 'chart.umd.js');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -17,8 +20,61 @@ ensureRuntimeDirs();
 
 // ── Data helpers ─────────────────────────────────────────────────────────────
 const CONSUMO_PATH = path.join(runtimePaths.dataDir, 'consumo.json');
+const SYNC_STATE_PATH = path.join(runtimePaths.tempDir, 'sync-status.json');
 const PERIOD_DETAIL_CACHE = new Map();
 const PERIOD_DETAILS_DIR = path.join(runtimePaths.dataDir, 'periodos_detalle');
+const EXPORT_ALLOWLIST = Object.freeze({
+  'consumo_ute_2024.xlsx': 'consumo_ute_2024.xlsx',
+  'consumo_ute_2025.xlsx': 'consumo_ute_2025.xlsx',
+  'consumo_ute_2026.xlsx': 'consumo_ute_2026.xlsx',
+});
+const SAFE_EXPORT_FILE_RE = /^[A-Za-z0-9._-]+$/;
+
+function normalizeExportFileName(rawName) {
+  if (typeof rawName !== 'string' || !rawName.length) return null;
+
+  const raw = rawName.trim();
+  if (raw !== rawName || raw.includes('\u0000')) return null;
+  if (raw.includes('/') || raw.includes('\\') || raw.includes('..')) return null;
+  if (!SAFE_EXPORT_FILE_RE.test(raw)) return null;
+
+  let decoded = raw;
+  for (let index = 0; index < 3; index += 1) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  if (decoded.includes('/') || decoded.includes('\\') || decoded.includes('..') || decoded.includes('\u0000')) {
+    return null;
+  }
+  if (!SAFE_EXPORT_FILE_RE.test(decoded) || path.isAbsolute(decoded)) return null;
+  if (path.basename(decoded) !== decoded) return null;
+  if (!Object.hasOwn(EXPORT_ALLOWLIST, decoded)) return null;
+  return EXPORT_ALLOWLIST[decoded];
+}
+
+function resolveSafeExportPath(rawName) {
+  const fileName = normalizeExportFileName(rawName);
+  if (!fileName) return null;
+
+  const candidate = path.join(runtimePaths.dataDir, fileName);
+  if (!fs.existsSync(candidate)) return null;
+
+  try {
+    const dataRoot = fs.realpathSync(runtimePaths.dataDir);
+    const realFile = fs.realpathSync(candidate);
+    const relative = path.relative(dataRoot, realFile);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    return realFile;
+  } catch (error) {
+    return null;
+  }
+}
 
 function hasConfiguredCredentials() {
   return Boolean(process.env.UTE_EMAIL && process.env.UTE_PASSWORD);
@@ -29,8 +85,14 @@ function missingCredentialsPayload() {
     error: 'missing_credentials',
     login_required: true,
     message: 'Login requerido',
-    detail: 'Configurá ute_email y ute_password en las opciones del add-on.'
+    detail: 'Configurá Usuario UTE / número de cuenta y contraseña en las opciones del add-on.'
   };
+}
+
+function requireConfiguredCredentials(res) {
+  if (hasConfiguredCredentials()) return true;
+  res.status(428).json(missingCredentialsPayload());
+  return false;
 }
 
 function loadHistorical() {
@@ -79,16 +141,17 @@ function parsePortalDateServer(text) {
   return new Date(y, (m || 1) - 1, d || 1);
 }
 
-function spawnDetached(args) {
-  const { spawn } = require('child_process');
-  const child = spawn('node', ['ute_monitor.js', ...args], {
-    cwd: __dirname, detached: true, stdio: 'ignore', env: process.env
-  });
-  child.unref();
+const syncManager = new SyncManager({ cwd: __dirname, statePath: SYNC_STATE_PATH });
+const AUTO_CURRENT_REFRESH_MAX_AGE_MS = 8 * 60 * 60 * 1000;
+const AUTO_CURRENT_REFRESH_CHECK_MS = 3 * 60 * 60 * 1000;
+
+function startSync(kind, args) {
+  return syncManager.start(kind, args, process.env);
 }
 
 // ── API routes ────────────────────────────────────────────────────────────────
 app.get('/api/data', (req, res) => {
+  if (!requireConfiguredCredentials(res)) return;
   res.json(loadHistorical());
 });
 
@@ -98,6 +161,10 @@ app.get('/api/config-status', (req, res) => {
     credentials_configured: credentialsConfigured,
     login_required: !credentialsConfigured
   });
+});
+
+app.get('/api/sync-status', (_req, res) => {
+  res.json(syncManager.getStatus());
 });
 
 // Serves data/periodo_actual.json — written by `node ute_monitor.js current` (or download)
@@ -118,10 +185,13 @@ app.get('/api/current', (req, res) => {
 });
 
 app.get('/api/period-detail-index', (req, res) => {
+  if (!requireConfiguredCredentials(res)) return;
   res.json(loadPeriodDetailIndex());
 });
 
 app.get('/api/period-detail', (req, res) => {
+  if (!requireConfiguredCredentials(res)) return;
+
   const { start, end } = req.query || {};
   const validDate = /^\d{2}-\d{2}-\d{4}$/;
   if (!validDate.test(String(start || '')) || !validDate.test(String(end || ''))) {
@@ -163,12 +233,9 @@ app.post('/api/refresh', (req, res) => {
     return res.status(428).json(missingCredentialsPayload());
   }
 
-  try {
-    spawnDetached(['download']);
-    res.json({ message: 'Descarga completa iniciada en segundo plano' });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  const job = startSync('download', ['download']);
+  if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
+  return res.status(202).json({ message: 'Descarga completa aceptada.', job });
 });
 
 // Trigger lightweight current-period-only refresh (~1 min vs ~5 min for full download)
@@ -177,15 +244,14 @@ app.post('/api/refresh-current', (req, res) => {
     return res.status(428).json(missingCredentialsPayload());
   }
 
-  try {
-    spawnDetached(['current']);
-    res.json({ message: 'Actualización de período actual iniciada' });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  const job = startSync('current', ['current']);
+  if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
+  return res.status(202).json({ message: 'Actualización de período actual aceptada.', job });
 });
 
 app.get('/api/ha/summary', (req, res) => {
+  if (!requireConfiguredCredentials(res)) return;
+
   const historical = loadHistorical();
   const current = loadPeriodoActual();
   const latest = historical[historical.length - 1] || null;
@@ -200,29 +266,46 @@ app.get('/api/ha/summary', (req, res) => {
 
 // ── Excel download ────────────────────────────────────────────────────────────
 app.get('/data/:file', (req, res) => {
-  const p = path.join(runtimePaths.dataDir, req.params.file);
-  if (fs.existsSync(p)) res.sendFile(p);
-  else res.status(404).send('Not found');
+  if (!requireConfiguredCredentials(res)) return;
+
+  const exportPath = resolveSafeExportPath(req.params.file);
+  if (!exportPath) return res.status(404).send('Not found');
+  return res.sendFile(exportPath);
 });
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ── Daily auto-refresh ────────────────────────────────────────────────────────
-// While the web server is running, check every hour and refresh if data is > 20h old
+app.get('/vendor/chart.umd.js', (_req, res) => {
+  res.type('application/javascript').sendFile(CHART_BUNDLE);
+});
+
+// ── Background current-period refresh ────────────────────────────────────────
+// UTE viene publicando con un atraso visible cercano a 48h, asi que alcanza
+// con refrescar el periodo actual unas pocas veces por dia.
 setInterval(() => {
   if (!hasConfiguredCredentials()) return;
+  if (syncManager.isRunning()) return;
 
   const data = loadPeriodoActual();
   const ageMs = data
     ? Date.now() - new Date(data.fetched_at).getTime()
     : Infinity;
-  if (ageMs > 20 * 60 * 60 * 1000) {
-    console.log('[Auto] periodo_actual.json desactualizado, refrescando...');
-    spawnDetached(['current']);
+  if (ageMs > AUTO_CURRENT_REFRESH_MAX_AGE_MS) {
+    logEvent('info', 'sync.auto_requested', { kind: 'current' });
+    startSync('current-auto', ['current']);
   }
-}, 60 * 60 * 1000); // check every hour
+}, AUTO_CURRENT_REFRESH_CHECK_MS);
+
+function scheduleInitialSync() {
+  if (!hasConfiguredCredentials() || syncManager.isRunning()) return;
+  const hasHistory = loadHistorical().length > 0;
+  const hasCurrent = Boolean(loadPeriodoActual());
+  if (hasHistory && hasCurrent) return;
+  logEvent('info', 'sync.initial_requested', { has_history: hasHistory, has_current: hasCurrent });
+  startSync('initial-download', ['download']);
+}
 
 // ── SPA ───────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send(HTML));
@@ -232,6 +315,7 @@ app.listen(PORT, () => {
   console.log('║  ⚡ UTE Monitor Dashboard              ║');
   console.log(`║  🌐 http://localhost:${PORT}              ║`);
   console.log('╚════════════════════════════════════════╝\n');
+  setTimeout(scheduleInitialSync, 750);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -243,7 +327,7 @@ const HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>UTE Monitor</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="vendor/chart.umd.js"></script>
 <style>
   :root {
     --blue: #1a56db;
@@ -310,6 +394,63 @@ const HTML = `<!DOCTYPE html>
   }
   .btn-primary:hover { background: #f8fbff; }
   #refreshStatus { font-size: .8rem; opacity: .7; }
+  .sync-menu { position: relative; }
+  .sync-menu[aria-disabled="true"] .sync-summary {
+    opacity: .58;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+  .sync-summary {
+    list-style: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .sync-summary::-webkit-details-marker { display: none; }
+  .sync-popover {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 10px);
+    width: 250px;
+    padding: 8px;
+    border-radius: 14px;
+    border: 1px solid rgba(148, 163, 184, .2);
+    background: rgba(15, 23, 42, .96);
+    box-shadow: 0 20px 45px rgba(15, 23, 42, .2);
+    display: grid;
+    gap: 6px;
+    z-index: 20;
+  }
+  .sync-action {
+    width: 100%;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 12px;
+    text-align: left;
+    font: inherit;
+    cursor: pointer;
+    color: #e5eefc;
+    background: rgba(255,255,255,.05);
+  }
+  .sync-action:hover { background: rgba(255,255,255,.12); }
+  .sync-action:disabled {
+    opacity: .55;
+    cursor: not-allowed;
+    background: rgba(255,255,255,.04);
+  }
+  .sync-action strong { display: block; font-size: .92rem; }
+  .sync-action span {
+    display: block;
+    margin-top: 2px;
+    font-size: .77rem;
+    color: rgba(226, 232, 240, .78);
+  }
+  .sync-status {
+    min-height: 18px;
+    margin-bottom: 10px;
+    font-size: .8rem;
+    color: var(--text-soft);
+  }
 
   /* ── Layout ── */
   .page { max-width: 1280px; margin: 0 auto; padding: 18px 16px 28px; }
@@ -773,11 +914,6 @@ const HTML = `<!DOCTYPE html>
     <h1>⚡ UTE Monitor</h1>
     <span>${DISPLAY_CONTEXT.accountLabel} · ${DISPLAY_CONTEXT.tariffLabel} · ${DISPLAY_CONTEXT.locationLabel}</span>
   </div>
-  <div class="header-right">
-    <span id="refreshStatus"></span>
-    <button class="btn btn-ghost" id="refreshCurrentBtn" onclick="refreshCurrent()">🔄 Actualizar período</button>
-    <button class="btn btn-primary" id="downloadBtn" onclick="triggerDownload()">⬇ Descargar datos</button>
-  </div>
 </header>
 
 <div class="page">
@@ -891,8 +1027,22 @@ const HTML = `<!DOCTYPE html>
           <option value="current">⚡ Período actual</option>
         </select>
         <div id="cacheLabel" style="font-size:.8rem;color:var(--text-soft)"></div>
+        <details class="sync-menu" id="syncMenu" aria-disabled="false">
+          <summary class="btn btn-primary sync-summary">↻ Sincronizar</summary>
+          <div class="sync-popover">
+            <button class="sync-action" id="syncCurrentBtn" onclick="runSyncAction('current')">
+              <strong>Actualizar período actual</strong>
+              <span>Trae la última curva visible del portal. Demora cerca de 1 minuto.</span>
+            </button>
+            <button class="sync-action" id="syncFullBtn" onclick="runSyncAction('full')">
+              <strong>Descargar historial completo</strong>
+              <span>Refresca facturas, historial mensual y después vuelve a traer el período actual.</span>
+            </button>
+          </div>
+        </details>
       </div>
     </div>
+    <div id="refreshStatus" class="sync-status"></div>
     <div id="currentContent" class="current-loading">Conectando con el portal UTE…</div>
   </div>
 
@@ -999,6 +1149,7 @@ let DAILY_DETAIL_CACHE = {};
 let dailyDetailRequestId = 0;
 let DAILY_PERIOD_INDEX = [];
 let CONFIG_STATUS = { credentials_configured: true, login_required: false };
+let SYNC_BUSY = false;
 const URUGUAY_HOLIDAYS = ${JSON.stringify(URUGUAY_HOLIDAYS)};
 const URUGUAY_HOLIDAY_SET = new Set(URUGUAY_HOLIDAYS);
 
@@ -1014,13 +1165,52 @@ async function loadConfigStatus() {
 }
 
 function setLoginRequiredUi(required) {
-  const refreshBtn = document.getElementById('refreshCurrentBtn');
-  const downloadBtn = document.getElementById('downloadBtn');
-  if (refreshBtn) refreshBtn.disabled = required;
-  if (downloadBtn) downloadBtn.disabled = required;
+  const syncCurrentBtn = document.getElementById('syncCurrentBtn');
+  const syncFullBtn = document.getElementById('syncFullBtn');
+  const syncMenu = document.getElementById('syncMenu');
+  if (syncCurrentBtn) syncCurrentBtn.disabled = required;
+  if (syncFullBtn) syncFullBtn.disabled = required;
+  if (syncMenu) {
+    syncMenu.setAttribute('aria-disabled', required ? 'true' : 'false');
+    if (required) syncMenu.open = false;
+  }
+}
+
+function clearHistoricalUi() {
+  HIST_DATA = [];
+  ALL_DATA = [];
+  VIEW_DATA = [];
+  _tableMonths = [];
+  CURRENT_DATA = null;
+  DAILY_PERIOD_INDEX = [];
+  DAILY_DETAIL_CACHE = {};
+  ACTIVE_DAILY_PERIOD = 'current';
+
+  document.getElementById('kpiLastKwh').innerHTML = '<span class="kpi-loading">Login</span>';
+  document.getElementById('kpiLastMonth').textContent = 'Configurá el add-on';
+  document.getElementById('kpiLastCost').innerHTML = '<span class="kpi-loading">Login</span>';
+  document.getElementById('kpiLastCostSub').textContent = 'Sin historial visible hasta configurar credenciales';
+  document.getElementById('kpiAvgKwh').innerHTML = '<span class="kpi-loading">Login</span>';
+  document.getElementById('kpiAvgSub').textContent = 'El historial se desbloquea cuando el add-on tiene login';
+  document.getElementById('chartSubtitle').textContent = 'Login requerido';
+  document.getElementById('tramoSubtitle').textContent = 'Login requerido';
+  document.getElementById('tramoPct').innerHTML = '';
+  document.getElementById('tableBody').innerHTML =
+    '<tr><td colspan="10" style="padding:18px;text-align:center;color:#64748b">Login requerido para ver historial y detalle mensual.</td></tr>';
+  document.getElementById('facturaEstimada').innerHTML = '';
+
+  if (mainChart) {
+    mainChart.destroy();
+    mainChart = null;
+  }
+  if (tramoChart) {
+    tramoChart.destroy();
+    tramoChart = null;
+  }
 }
 
 function renderLoginRequired() {
+  clearHistoricalUi();
   setLoginRequiredUi(true);
   document.getElementById('refreshStatus').textContent = 'Login requerido';
   document.getElementById('kpiCurrent').innerHTML = '<span class="kpi-loading">Login</span>';
@@ -1040,7 +1230,7 @@ function renderLoginRequired() {
     '<div class="login-card">' +
       '<div class="login-eyebrow">Login</div>' +
       '<h2>Conectá tu cuenta de UTE</h2>' +
-      '<p>Este add-on todavía no tiene un login configurado. Abrí la pestaña <b>Configuration</b> del add-on, cargá <code>ute_email</code> y <code>ute_password</code>, guardá y reiniciá el add-on.</p>' +
+      '<p>Este add-on todavía no tiene un login configurado. Abrí la pestaña <b>Configuration</b> del add-on, cargá tu <b>Usuario UTE / número de cuenta</b> (no email) y la contraseña, guardá y reiniciá el add-on.</p>' +
       '<button class="login-action" onclick="checkLoginStatus()">Revisar estado</button>' +
     '</div>';
 }
@@ -1204,6 +1394,14 @@ async function init() {
   CONFIG_STATUS = await loadConfigStatus();
   setLoginRequiredUi(Boolean(CONFIG_STATUS.login_required));
 
+  if (CONFIG_STATUS.login_required) {
+    clearHistoricalUi();
+    populateFilterSelects();
+    populateDailyPeriodSelect();
+    renderLoginRequired();
+    return;
+  }
+
   const data = await fetch('api/data').then(r => r.json());
   DAILY_PERIOD_INDEX = await fetch('api/period-detail-index').then(r => r.json()).catch(() => []);
   HIST_DATA = data.sort((a,b) => a.año !== b.año ? a.año - b.año : a.mes - b.mes);
@@ -1212,10 +1410,6 @@ async function init() {
   populateFilterSelects();
   populateDailyPeriodSelect();
   applyFilter();
-  if (CONFIG_STATUS.login_required) {
-    renderLoginRequired();
-    return;
-  }
   loadCurrent();
 }
 
@@ -1412,6 +1606,11 @@ function setCustomRange() {
 }
 
 function applyFilter() {
+  if (!ALL_DATA.length) {
+    clearHistoricalUi();
+    return;
+  }
+
   const last = ALL_DATA[ALL_DATA.length - 1];
   const lastDate = new Date(last.año, last.mes - 1);
 
@@ -2375,11 +2574,43 @@ async function loadCurrent() {
 }
 
 // ─── Actions ──────────────────────────────────────────────────────────────────
+async function waitForSync(job) {
+  const s = document.getElementById('refreshStatus');
+  const jobId = job?.id;
+  if (!jobId) throw new Error('No se recibió el identificador de sincronización');
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const status = await fetch('api/sync-status').then(r => r.json()).catch(() => null);
+    if (!status || status.id !== jobId) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      continue;
+    }
+    if (status.status === 'queued' || status.status === 'running') {
+      s.textContent = 'Sincronizando: ' + (status.stage || 'procesando') + '…';
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      continue;
+    }
+    if (status.status === 'succeeded') {
+      s.textContent = '✓ Datos actualizados';
+      await init();
+      setTimeout(() => { s.textContent = ''; }, 3500);
+      return;
+    }
+    const message = status.error?.message || 'La sincronización no se pudo completar. Revisá los logs del add-on.';
+    throw new Error(message);
+  }
+  throw new Error('La sincronización sigue en curso. Revisá el estado y los logs del add-on.');
+}
+
 async function triggerDownload() {
   const s = document.getElementById('refreshStatus');
   if (!(await ensureLoginReady())) return;
-
-  s.textContent = 'Iniciando descarga completa…';
+  if (SYNC_BUSY) {
+    s.textContent = 'Ya hay una sincronización en curso.';
+    return;
+  }
+  SYNC_BUSY = true;
+  s.textContent = 'Enviando descarga completa…';
   try {
     const response = await fetch('api/refresh', { method: 'POST' });
     const body = await response.json().catch(() => ({}));
@@ -2387,53 +2618,49 @@ async function triggerDownload() {
       renderLoginRequired();
       return;
     }
-    if (!response.ok) throw new Error(body.error || 'No se pudo iniciar la descarga');
-    s.textContent = 'Descarga iniciada ✓ (puede tardar ~5 min)';
-    setTimeout(() => { s.textContent = ''; }, 8000);
+    if (!response.ok) throw new Error(body.error || 'No se pudo aceptar la descarga');
+    await waitForSync(body.job);
   } catch(e) {
     s.textContent = 'Error: ' + e.message;
+  } finally {
+    SYNC_BUSY = false;
   }
 }
 
 async function refreshCurrent() {
   const s = document.getElementById('refreshStatus');
   if (!(await ensureLoginReady())) return;
+  if (SYNC_BUSY) {
+    s.textContent = 'Ya hay una sincronización en curso.';
+    return;
+  }
+  SYNC_BUSY = true;
 
-  // Capture current fetched_at before triggering refresh
-  const before   = await fetch('api/current').then(r => r.json()).catch(() => null);
-  const prevTs   = before?.fetched_at || '';
-
-  s.innerHTML = 'Actualizando <span class="spinner"></span>';
+  s.innerHTML = 'Enviando actualización <span class="spinner"></span>';
   try {
     const response = await fetch('api/refresh-current', { method: 'POST' });
     const body = await response.json().catch(() => ({}));
     if (body.login_required) {
       renderLoginRequired();
+      SYNC_BUSY = false;
       return;
     }
-    if (!response.ok) throw new Error(body.error || 'No se pudo iniciar la actualización');
+    if (!response.ok) throw new Error(body.error || 'No se pudo aceptar la actualización');
+    await waitForSync(body.job);
   } catch(e) {
     s.textContent = 'Error: ' + e.message;
+    SYNC_BUSY = false;
     return;
   }
 
-  // Poll every 10s for up to 3 minutes waiting for new fetched_at
-  const deadline = Date.now() + 180000;
-  const poll = setInterval(async () => {
-    if (Date.now() > deadline) {
-      clearInterval(poll);
-      s.textContent = 'Actualización en curso — esperá un momento y recargá';
-      setTimeout(() => { s.textContent = ''; }, 6000);
-      return;
-    }
-    const d = await fetch('api/current').then(r => r.json()).catch(() => null);
-    if (d?.fetched_at && d.fetched_at !== prevTs) {
-      clearInterval(poll);
-      s.textContent = '✓ Datos actualizados';
-      loadCurrent();
-      setTimeout(() => { s.textContent = ''; }, 3000);
-    }
-  }, 10000);
+  SYNC_BUSY = false;
+}
+
+function runSyncAction(action) {
+  const syncMenu = document.getElementById('syncMenu');
+  if (syncMenu) syncMenu.open = false;
+  if (action === 'full') return triggerDownload();
+  return refreshCurrent();
 }
 
 init();

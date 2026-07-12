@@ -1,6 +1,8 @@
 configuration:
+  ute_user:
+    name: UTE user or account number (not email)
   ute_email:
-    name: UTE email
+    name: Legacy UTE user (migration only)
   ute_password:
     name: UTE password
   debug:
