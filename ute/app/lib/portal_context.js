@@ -3,6 +3,7 @@
 const DEFAULT_ACCOUNT_LABEL = 'Cuenta personal UTE';
 const DEFAULT_LOCATION_LABEL = 'Configuracion pendiente';
 const DEFAULT_PLAN_LABEL = 'Tarifa configurable';
+const { normalizePortalIdentity } = require('./portfolio_contract');
 
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -154,11 +155,65 @@ async function discoverPortalContext(page, options = {}) {
   return context;
 }
 
+async function discoverPortfolio(page, options = {}) {
+  const signals = await collectPageSignals(page);
+  const route = String(signals.pageUrl || '');
+  if (!route.includes('navigateSelectUserType')) {
+    const context = await discoverPortalContext(page, options);
+    return normalizePortalIdentity({
+      source: 'ute-portal-single',
+      accounts: [{ accountNumber: context.accountNumber, accountAlias: context.accountNumber ? `Cuenta ${context.accountNumber}` : 'Cuenta personal UTE', supplies: [{ ...context, alias: context.locationLabel || 'Suministro principal', location: context.locationLabel || 'Dirección no disponible', meters: [{ id: context.meterId, label: 'Medidor principal', type: 'electricity', status: 'unknown' }] }] }],
+    });
+  }
+
+  const rawOptions = await page.$$eval('a,button,option,input,li,div', nodes => nodes.map((node, index) => ({
+    index,
+    text: (node.innerText || node.textContent || node.value || '').replace(/\s+/g, ' ').trim(),
+    html: node.outerHTML || '',
+  })).filter(item => /cuenta|suministro|servicio|saId|spId|meterId/i.test(`${item.text} ${item.html}`)));
+  const optionsFound = rawOptions.map((item, index) => {
+    const context = extractContextFromText(`${item.text}\n${item.html}`);
+    return {
+      index: index + 1,
+      label: item.text || `Opción ${index + 1}`,
+      accountNumber: context.accountNumber,
+      accountAlias: item.text || null,
+      supplyAlias: item.text || null,
+      ...context,
+    };
+  }).filter(item => item.accountNumber || item.saId || item.spId || item.meterId);
+
+  const unique = [];
+  const seen = new Set();
+  for (const item of optionsFound) {
+    const key = [item.accountNumber, item.saId, item.spId, item.meterId, item.label].join('|');
+    if (!seen.has(key)) { seen.add(key); unique.push(item); }
+  }
+  if (!unique.length) throw new Error('La pantalla navigateSelectUserType no contiene opciones enumerables');
+  const accounts = unique.map(item => ({
+    accountNumber: item.accountNumber || `opcion-${item.index}`,
+    accountAlias: item.accountAlias || item.label,
+    supplies: [{
+      alias: item.supplyAlias || item.label,
+      location: item.locationLabel || 'Ubicación no disponible',
+      saId: item.saId,
+      spId: item.spId,
+      meterId: item.meterId,
+      badge: item.badge,
+      meters: item.meterId ? [{ id: item.meterId, label: 'Medidor principal', type: 'electricity', status: 'unknown' }] : [],
+      capabilities: { hasAMI: Boolean(item.meterId), supportsMaxDemand: false, supportsDailyDetail: Boolean(item.spId), canEstimateTRT: true },
+      selectedByDefault: unique.length === 1,
+    }],
+  }));
+  return normalizePortalIdentity({ source: 'ute-portal', accounts });
+}
+
 module.exports = {
   DEFAULT_ACCOUNT_LABEL,
   DEFAULT_LOCATION_LABEL,
   DEFAULT_PLAN_LABEL,
   buildDisplayContext,
   discoverPortalContext,
+  discoverPortfolio,
   getPortalContextFromEnv,
 };

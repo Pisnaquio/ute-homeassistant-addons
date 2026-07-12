@@ -11,9 +11,14 @@ const { loadPeriodDetail, savePeriodDetail } = require('./lib/period_detail_stor
 const { createUteDataSource } = require('./lib/ute_data_source');
 const { ensureRuntimeDirs, runtimePaths, isAddonRuntime } = require('./lib/runtime_env');
 const { redact } = require('./lib/safe_log');
+const { RuntimeStorage } = require('./lib/runtime_storage');
 
 const VERSION = '1.0.0';
 const VALID_PORTAL_SOURCE_MODES = new Set(['auto', 'http', 'playwright']);
+
+function safeErrorMessage(error) {
+  return redact(error?.message || error || 'error desconocido');
+}
 
 function parseYearMonth(text) {
   const match = String(text || '').match(/^(\d{4})-(\d{2})$/);
@@ -72,7 +77,23 @@ class UTEMonitor {
     this.scraperPassword = process.env.UTE_PASSWORD;
     this.debugMode = process.env.DEBUG === 'true';
     this.portalSourceMode = normalizePortalSourceMode(process.env.UTE_SOURCE || process.env.UTE_PORTAL_TRANSPORT || 'auto');
-    this.dataDir = runtimePaths.dataDir;
+    this.storage = new RuntimeStorage(runtimePaths);
+    this.storage.ensureSingleSupplyMigration();
+    const portfolio = this.storage.getPortfolio();
+    const requestedSupplyKey = this.storage.resolveSupplyKey(process.env.UTE_SUPPLY_KEY)
+      || this.storage.loadSelectedSupplyKey();
+    this.supplyKey = portfolio?.source === 'legacy-single-supply'
+      ? null
+      : requestedSupplyKey;
+    if (this.supplyKey && !this.storage.getActiveContext(this.supplyKey)) {
+      this.supplyKey = null;
+    }
+    if (!this.supplyKey && process.env.UTE_SYNC_ALL !== 'true' && portfolio && portfolio.accounts.flatMap((account) => account.supplies || []).length > 1) {
+      const error = new Error('SUPPLY_SELECTION_REQUIRED: seleccioná un suministro antes de sincronizar');
+      error.code = 'SUPPLY_SELECTION_REQUIRED';
+      throw error;
+    }
+    this.dataDir = this.supplyKey ? this.storage.getSupplyDataPath(this.supplyKey) : runtimePaths.dataDir;
     this.reportDir = runtimePaths.reportDir;
     this.logDir = runtimePaths.logDir;
 
@@ -80,6 +101,20 @@ class UTEMonitor {
     this.analyzer = new DataAnalyzer();
 
     ensureRuntimeDirs();
+  }
+
+  activateSupply(supplyKey) {
+    const resolved = this.storage.resolveSupplyKey(supplyKey);
+    const active = resolved ? this.storage.getActiveContext(resolved) : null;
+    if (!active) {
+      const error = new Error('SUPPLY_NOT_FOUND: el suministro seleccionado ya no existe en el portfolio');
+      error.code = 'SUPPLY_NOT_FOUND';
+      throw error;
+    }
+    this.supplyKey = resolved;
+    this.dataDir = this.storage.getSupplyDataPath(resolved);
+    this.processor = new DataProcessor(this.dataDir);
+    return active;
   }
 
   log(message, type = 'info') {
@@ -117,12 +152,44 @@ class UTEMonitor {
   }
 
   createDataSource() {
+    const active = this.supplyKey ? this.storage.getActiveContext(this.supplyKey) : null;
     return createUteDataSource({
       userId: this.scraperEmail,
       password: this.scraperPassword,
       debug: this.debugMode,
       mode: this.portalSourceMode,
+      supplyContext: active,
     });
+  }
+
+  async ensureSupplyPortfolio(source) {
+    if (this.supplyKey) return this.activateSupply(this.supplyKey);
+    const existing = this.storage.getPortfolio();
+    if (existing && existing.source !== 'legacy-single-supply') {
+      const supplies = existing.accounts.flatMap((account) => account.supplies || []);
+      if (supplies.length === 1) {
+        const selected = this.storage.getOrCreateSelectedSupply(existing);
+        const active = this.activateSupply(selected);
+        source.setSupplyContext?.(active);
+        return active;
+      }
+      const error = new Error('SUPPLY_SELECTION_REQUIRED: el portal tiene múltiples suministros');
+      error.code = 'SUPPLY_SELECTION_REQUIRED';
+      throw error;
+    }
+    const discovered = await source.discoverPortfolio();
+    const portfolio = this.storage.savePortfolio(discovered);
+    const supplies = portfolio.accounts.flatMap((account) => account.supplies || []);
+    const selected = this.storage.getOrCreateSelectedSupply(portfolio);
+    if (supplies.length !== 1) {
+      const error = new Error('SUPPLY_SELECTION_REQUIRED: seleccioná un suministro antes de sincronizar');
+      error.code = 'SUPPLY_SELECTION_REQUIRED';
+      error.portfolio = portfolio;
+      throw error;
+    }
+    const active = this.activateSupply(selected);
+    source.setSupplyContext?.(active);
+    return active;
   }
 
   logSourceResult(result) {
@@ -131,7 +198,7 @@ class UTEMonitor {
       `[UTE source] operation=${result.operation} selected=${result.source}` +
       ` duration_ms=${result.durationMs}`;
     if (result.fallbackFrom) {
-      console.log(chalk.yellow(`${message} fallback=${result.fallbackFrom}->${result.source} reason="${result.fallbackReason}"`));
+      console.log(chalk.yellow(`${message} fallback=${result.fallbackFrom}->${result.source} reason="${redact(result.fallbackReason)}"`));
     } else {
       console.log(chalk.gray(message));
     }
@@ -154,6 +221,7 @@ class UTEMonitor {
 
       this.validateCredentials();
       source = this.createDataSource();
+      await this.ensureSupplyPortfolio(source);
       const monthlyResult = await source.fetchMonthlyData();
       this.logSourceResult(monthlyResult);
       const rawData = monthlyResult.data;
@@ -191,17 +259,43 @@ class UTEMonitor {
         console.log('\n⚡ Actualizando período actual...');
         await this.currentPeriod();
       } catch (e) {
-        console.warn(chalk.yellow(`⚠  No se pudo actualizar período actual: ${e.message}`));
+        console.warn(chalk.yellow(`⚠  No se pudo actualizar período actual: ${safeErrorMessage(e)}`));
       }
 
       return mergedData;
 
     } catch (error) {
       this.log(`Error en descarga: ${error.message}`, 'error');
-      console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
+      console.error(chalk.red(`\n❌ Error: ${safeErrorMessage(error)}\n`));
       throw error;
     } finally {
       if (source) await source.close().catch(() => {});
+    }
+  }
+
+  async syncAll() {
+    this.validateCredentials();
+    const supplies = (this.storage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
+    if (!supplies.length) throw new Error('No hay portfolio descubierto para sincronizar');
+    const { spawnSync } = require('child_process');
+    const failures = [];
+    for (const supply of supplies) {
+      this.log(`Sincronizando suministro ${supply.supplyKey}`);
+      const result = spawnSync(process.execPath, [__filename, 'download'], {
+        cwd: __dirname,
+        env: { ...process.env, UTE_SUPPLY_KEY: supply.supplyKey, UTE_SYNC_ALL: 'false' },
+        stdio: 'inherit',
+      });
+      if (result.status !== 0) {
+        failures.push(supply.supplyKey);
+        this.log(`⚠️ Falló sincronización parcial del suministro ${supply.supplyKey}`, 'warn');
+      }
+    }
+    if (failures.length) {
+      const error = new Error(`SYNC_PARTIAL_FAILURE: ${failures.join(', ')}`);
+      error.code = 'SYNC_PARTIAL_FAILURE';
+      error.failedSupplyKeys = failures;
+      throw error;
     }
   }
 
@@ -217,6 +311,7 @@ class UTEMonitor {
 
       this.validateCredentials();
       source = this.createDataSource();
+      await this.ensureSupplyPortfolio(source);
       const currentResult = await source.fetchCurrentPeriod();
       this.logSourceResult(currentResult);
       const data = currentResult.data;
@@ -239,7 +334,7 @@ class UTEMonitor {
 
     } catch (error) {
       this.log(`Error actualizando período actual: ${error.message}`, 'error');
-      console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
+      console.error(chalk.red(`\n❌ Error: ${safeErrorMessage(error)}\n`));
       throw error;
     } finally {
       if (source) await source.close().catch(() => {});
@@ -299,7 +394,7 @@ class UTEMonitor {
     } catch (error) {
       if (!jsonOnly) {
         this.log(`Error cargando detalle diario: ${error.message}`, 'error');
-        console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
+        console.error(chalk.red(`\n❌ Error: ${safeErrorMessage(error)}\n`));
       }
       throw error;
     } finally {
@@ -352,8 +447,8 @@ class UTEMonitor {
           results.saved += 1;
           console.log(chalk.green(`  ✓ Guardado ${label} (${detail.consumo_kwh} kWh)`));
         } catch (error) {
-          results.failed.push({ label, error: error.message, periodoInicio, periodoFin });
-          console.log(chalk.yellow(`  ⚠ No se pudo guardar ${label}: ${error.message}`));
+          results.failed.push({ label, error: safeErrorMessage(error), periodoInicio, periodoFin });
+          console.log(chalk.yellow(`  ⚠ No se pudo guardar ${label}: ${safeErrorMessage(error)}`));
         }
       }
 
@@ -368,7 +463,7 @@ class UTEMonitor {
       return results;
     } catch (error) {
       this.log(`Error en backfill de detalle diario: ${error.message}`, 'error');
-      console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
+      console.error(chalk.red(`\n❌ Error: ${safeErrorMessage(error)}\n`));
       throw error;
     } finally {
       if (source) await source.close().catch(() => {});
@@ -404,7 +499,7 @@ class UTEMonitor {
 
     } catch (error) {
       this.log(`Error en análisis: ${error.message}`, 'error');
-      console.error(chalk.red(`❌ Error: ${error.message}`));
+      console.error(chalk.red(`❌ Error: ${safeErrorMessage(error)}`));
       throw error;
     }
   }
@@ -430,11 +525,10 @@ class UTEMonitor {
         try {
           const data = await this.download();
           await this.analyze(data);
-          await this.report();
           console.log(chalk.green('✅ Descarga automática completada exitosamente'));
           this.log('Descarga automática completada exitosamente', 'success');
         } catch (error) {
-          console.error(chalk.red(`❌ Error en descarga automática: ${error.message}`));
+          console.error(chalk.red(`❌ Error en descarga automática: ${safeErrorMessage(error)}`));
           this.log(`Error en descarga automática: ${error.message}`, 'error');
         }
       });
@@ -449,7 +543,7 @@ class UTEMonitor {
       process.stdin.resume();
 
     } catch (error) {
-      console.error(chalk.red(`❌ Error configurando descarga automática: ${error.message}`));
+      console.error(chalk.red(`❌ Error configurando descarga automática: ${safeErrorMessage(error)}`));
       throw error;
     }
   }
@@ -496,7 +590,7 @@ class UTEMonitor {
       console.log();
 
     } catch (error) {
-      console.error(chalk.red(`❌ Error mostrando estado: ${error.message}`));
+      console.error(chalk.red(`❌ Error mostrando estado: ${safeErrorMessage(error)}`));
     }
   }
 
@@ -563,6 +657,10 @@ class UTEMonitor {
         await this.download();
         break;
 
+      case 'sync-all':
+        await this.syncAll();
+        break;
+
       case 'current':
         await this.currentPeriod();
         break;
@@ -615,9 +713,12 @@ class UTEMonitor {
   }
 }
 
-// Ejecutar
-const monitor = new UTEMonitor();
-monitor.run().catch(error => {
-  console.error(chalk.red(`Error fatal: ${error.message}`));
-  process.exit(1);
-});
+if (require.main === module) {
+  const monitor = new UTEMonitor();
+  monitor.run().catch(error => {
+    console.error(chalk.red(`Error fatal: ${safeErrorMessage(error)}`));
+    process.exit(1);
+  });
+}
+
+module.exports = { UTEMonitor };

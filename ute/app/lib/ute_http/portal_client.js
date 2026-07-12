@@ -16,6 +16,7 @@ const {
   shiftMonth,
   tryParseJson,
 } = require('./parsers');
+const { normalizePortalIdentity } = require('../portfolio_contract');
 
 const BASE = 'https://autoservicio.ute.com.uy/SelfService/SSvcController';
 const MIN_MONTHLY_HISTORY_MONTHS = 26;
@@ -27,12 +28,14 @@ class UtePortalClient {
     this.userId = options.userId || process.env.UTE_USER_ID || process.env.UTE_EMAIL;
     this.password = options.password || process.env.UTE_PASSWORD;
     this.client = new HttpClient();
-    this.ids = {
+    this.context = Object.freeze({
       saId: options.saId || process.env.UTE_SA_ID || null,
       spId: options.spId || process.env.UTE_SP_ID || null,
       meterId: options.meterId || process.env.UTE_METER_ID || null,
       badge: options.badge || process.env.UTE_BADGE || null,
-    };
+      accountNumber: options.accountNumber || null,
+      portfolioSupplyCount: Number(options.portfolioSupplyCount || 0),
+    });
   }
 
   async login() {
@@ -51,6 +54,11 @@ class UtePortalClient {
     });
 
     const loggedIn = this.isLoggedInText(response.text);
+    if (response.url && response.url.includes('/navigateSelectUserType')) {
+      this.userTypePage = response.text;
+      this.userTypeOptions = parseUserTypeOptions(response.text);
+      return response;
+    }
     if (!loggedIn) {
       const account = await this.client.get(`${BASE}/account`);
       if (!this.isLoggedInText(account.text)) {
@@ -60,6 +68,67 @@ class UtePortalClient {
     }
 
     return response;
+  }
+
+  /**
+   * Descubre el portfolio completo luego del login. La pantalla
+   * navigateSelectUserType es una pantalla válida de autenticación, no un
+   * error de credenciales. Se enumeran todas las opciones y sólo se fija
+   * contexto automáticamente si existe exactamente un suministro.
+   */
+  async discoverPortfolio() {
+    const html = this.userTypePage || (await this.fetchAccountPage());
+    const options = this.userTypeOptions || parseUserTypeOptions(html);
+    const accountGroups = new Map();
+    for (const option of options) {
+      const ids = mergeIdentifiers({}, option.ids || {});
+      let enriched = ids;
+      if (ids.saId && ids.spId) {
+        try {
+          enriched = mergeIdentifiers(enriched, extractAccountIdentifiers(await this.fetchCurvePage(ids.saId, ids.spId)));
+        } catch (_) { /* opción visible pero curva temporalmente no disponible */ }
+      }
+      if (enriched.saId && (!enriched.meterId || !enriched.badge)) {
+        try {
+          enriched = mergeIdentifiers(enriched, extractAccountIdentifiers(await this.fetchConsumptionHistoryPage(enriched.saId)));
+        } catch (_) { /* conservar la opción para diagnóstico */ }
+      }
+      const accountNumber = option.accountNumber || enriched.accountNumber || `opcion-${option.index}`;
+      const accountId = option.accountId || accountNumber;
+      const key = `${accountId}`;
+      if (!accountGroups.has(key)) accountGroups.set(key, { accountId, accountNumber, accountAlias: option.accountAlias || `Cuenta ${accountNumber}`, supplies: [] });
+      accountGroups.get(key).supplies.push({
+        alias: option.supplyAlias || option.label || `Suministro ${option.index}`,
+        location: option.location || 'Ubicación no disponible',
+        saId: enriched.saId,
+        spId: enriched.spId,
+        meterId: enriched.meterId,
+        badge: enriched.badge,
+        meters: enriched.meterId ? [{ id: enriched.meterId, label: 'Medidor principal', type: 'electricity', status: 'unknown' }] : [],
+        capabilities: { hasAMI: Boolean(enriched.meterId), supportsMaxDemand: false, supportsDailyDetail: Boolean(enriched.spId), canEstimateTRT: true },
+        tariffs: [],
+        selectedByDefault: options.length === 1,
+      });
+    }
+    const portfolio = normalizePortalIdentity({ source: 'ute-portal', accounts: [...accountGroups.values()] });
+    const supplies = portfolio.accounts.flatMap((account) => account.supplies);
+    if (supplies.length === 1) this.setSupplyContext(supplies[0].technical);
+    return portfolio;
+  }
+
+  setSupplyContext(context = {}) {
+    const technical = context.technical && typeof context.technical === 'object'
+      ? context.technical
+      : context;
+    this.context = Object.freeze({
+      saId: technical.saId || null,
+      spId: technical.spId || null,
+      meterId: technical.meterId || null,
+      badge: technical.badge || null,
+      accountNumber: context.accountNumber || technical.accountNumber || null,
+      portfolioSupplyCount: Number(context.portfolioSupplyCount || technical.portfolioSupplyCount || 0),
+    });
+    return this.context;
   }
 
   async fetchAccountPage() {
@@ -73,49 +142,46 @@ class UtePortalClient {
   async discoverIdentifiers() {
     const accountHtml = await this.fetchAccountPage();
     const accountIds = extractAccountIdentifiers(accountHtml);
-    this.ids = mergeIdentifiers(this.ids, accountIds);
+    this.context = Object.freeze(mergeIdentifiers(this.context, accountIds));
 
-    if (this.ids.saId && this.ids.spId) {
-      const curvaHtml = await this.fetchCurvePage(this.ids.saId, this.ids.spId);
+    if (this.context.saId && this.context.spId) {
+      const curvaHtml = await this.fetchCurvePage(this.context.saId, this.context.spId);
       const curveIds = extractAccountIdentifiers(curvaHtml);
-      this.ids = mergeIdentifiers(this.ids, curveIds);
+      this.context = Object.freeze(mergeIdentifiers(this.context, curveIds));
     } else {
       const fallbackCurvaLinks = this.extractCurveRouteCandidates(accountHtml);
       if (fallbackCurvaLinks[0]) {
         const url = fallbackCurvaLinks[0];
         const match = url.match(/saId=(\d+).*spId=(\d+)/i);
         if (match) {
-          this.ids.saId = this.ids.saId || match[1];
-          this.ids.spId = this.ids.spId || match[2];
-          const curvaHtml = await this.fetchCurvePage(this.ids.saId, this.ids.spId);
+          this.context = Object.freeze({ ...this.context, saId: this.context.saId || match[1], spId: this.context.spId || match[2] });
+          const curvaHtml = await this.fetchCurvePage(this.context.saId, this.context.spId);
           const curveIds = extractAccountIdentifiers(curvaHtml);
-          this.ids = mergeIdentifiers(this.ids, curveIds);
+          this.context = Object.freeze(mergeIdentifiers(this.context, curveIds));
         }
       }
     }
 
-    if (!this.ids.meterId || !this.ids.badge) {
+    if (!this.context.meterId || !this.context.badge) {
       const consumoRoute = this.extractConsumptionRouteCandidate(accountHtml);
       if (consumoRoute) {
         const parsedUrl = new URL(consumoRoute, `${BASE}/`);
-        this.ids.meterId = this.ids.meterId || parsedUrl.searchParams.get('meterId');
-        this.ids.badge = this.ids.badge || parsedUrl.searchParams.get('badge');
+        this.context = Object.freeze({ ...this.context, meterId: this.context.meterId || parsedUrl.searchParams.get('meterId'), badge: this.context.badge || parsedUrl.searchParams.get('badge') });
       }
     }
 
-    if ((!this.ids.meterId || !this.ids.badge) && this.ids.saId) {
-      const consumoHtml = await this.fetchConsumptionHistoryPage(this.ids.saId);
+    if ((!this.context.meterId || !this.context.badge) && this.context.saId) {
+      const consumoHtml = await this.fetchConsumptionHistoryPage(this.context.saId);
       const consumoRoute = this.extractConsumptionRouteCandidate(consumoHtml);
       if (consumoRoute) {
         const parsedUrl = new URL(consumoRoute, `${BASE}/`);
-        this.ids.meterId = this.ids.meterId || parsedUrl.searchParams.get('meterId');
-        this.ids.badge = this.ids.badge || parsedUrl.searchParams.get('badge');
+        this.context = Object.freeze({ ...this.context, meterId: this.context.meterId || parsedUrl.searchParams.get('meterId'), badge: this.context.badge || parsedUrl.searchParams.get('badge') });
       }
       const consumoIds = extractAccountIdentifiers(consumoHtml);
-      this.ids = mergeIdentifiers(this.ids, consumoIds);
+      this.context = Object.freeze(mergeIdentifiers(this.context, consumoIds));
     }
 
-    return this.ids;
+    return this.context;
   }
 
   async fetchCurvePage(saId, spId) {
@@ -160,16 +226,20 @@ class UtePortalClient {
     const punta = await this.fetchEnergyReadings('PUNTA', 'Punta');
     const valle = await this.fetchEnergyReadings('VALLE', 'Valle');
     const llano = await this.fetchEnergyReadings('LLANO', 'Llano');
-    const bills = await this.fetchBills();
+    // El historial de facturas del autoservicio no acepta un supplyId y puede
+    // devolver documentos de otra cuenta del mismo usuario. En portfolios
+    // múltiples preferimos omitir el costo real antes que mezclar suministros.
+    const isMultiSupply = this.context.portfolioSupplyCount > 1;
+    const bills = isMultiSupply ? [] : await this.fetchBills();
     const dataset = combineData(punta, valle, llano, bills);
-    return this.supplementHistoricGapWithBills(dataset, bills);
+    return isMultiSupply ? dataset : this.supplementHistoricGapWithBills(dataset, bills);
   }
 
   async fetchCurrentPeriod(options = {}) {
     await this.ensureIds(['saId', 'spId']);
-    const curveHtml = await this.fetchCurvePage(this.ids.saId, this.ids.spId);
-    const inicioRaw = parseDatepickerValue(curveHtml, `datepicker_${this.ids.spId}_inicio`);
-    const fin = parseDatepickerValue(curveHtml, `datepicker_${this.ids.spId}_fin`);
+    const curveHtml = await this.fetchCurvePage(this.context.saId, this.context.spId);
+    const inicioRaw = parseDatepickerValue(curveHtml, `datepicker_${this.context.spId}_inicio`);
+    const fin = parseDatepickerValue(curveHtml, `datepicker_${this.context.spId}_fin`);
 
     if (!inicioRaw || !fin) {
       throw new Error('No pude leer fechas del periodo actual desde cmvisualizarcurvadecarga');
@@ -197,7 +267,7 @@ class UtePortalClient {
     try {
       previousClosed = await this.fetchPeriodDetail(prevStart, prevEnd);
     } catch (error) {
-      previousClosed = { error: error.message };
+      previousClosed = { error: 'previous_period_unavailable' };
     }
 
     return {
@@ -220,7 +290,7 @@ class UtePortalClient {
   }
 
   async fetchEnergyReadings(tou, label) {
-    const url = `${BASE}/cmVerConsumo?meterId=${this.ids.meterId}&tou=${tou}&uom=KWH&badge=${this.ids.badge}&energia=${encodeURIComponent(`Energía ${label} kWh`)}`;
+    const url = `${BASE}/cmVerConsumo?meterId=${this.context.meterId}&tou=${tou}&uom=KWH&badge=${this.context.badge}&energia=${encodeURIComponent(`Energía ${label} kWh`)}`;
     const response = await this.client.get(url);
     return parseConsumptionHistory(response.text);
   }
@@ -264,7 +334,7 @@ class UtePortalClient {
         supplemented.push(detail);
         existingKeys.add(key);
       } catch (error) {
-        console.warn(`⚠️  No pude completar la factura histórica ${bill.emision || bill.billId}: ${error.message}`);
+        console.warn(`⚠️  No pude completar la factura histórica ${bill.emision || 'sin fecha'}: no disponible`);
       }
     }
 
@@ -277,7 +347,7 @@ class UtePortalClient {
 
     if (name === 'CURVA_DE_CONSUMO') {
       return `${base}?${p('graficas[0][name]')}=${name}` +
-        `&${p('graficas[0][parms][psId]')}=${this.ids.spId}` +
+        `&${p('graficas[0][parms][psId]')}=${this.context.spId}` +
         `&${p('graficas[0][parms][meterId]')}=` +
         `&${p('graficas[0][parms][fechaInicial]')}=${fechaInicio}` +
         `&${p('graficas[0][parms][fechaFinal]')}=${fechaFin}` +
@@ -286,7 +356,7 @@ class UtePortalClient {
     }
 
     return `${base}?${p('graficas[0][name]')}=${name}` +
-      `&${p('graficas[0][parms][psId]')}=${this.ids.spId}` +
+      `&${p('graficas[0][parms][psId]')}=${this.context.spId}` +
       `&${p('graficas[0][parms][fechaInicial]')}=${fechaInicio}` +
       `&${p('graficas[0][parms][fechaFinal]')}=${fechaFin}`;
   }
@@ -296,7 +366,7 @@ class UtePortalClient {
     const parsed = tryParseJson(response.text);
     if (!parsed) {
       if (options.nullOnFailure) return null;
-      throw new Error(`UTE devolvio contenido no JSON en ${url}`);
+      throw new Error('UTE devolvio contenido no JSON en un endpoint autenticado');
     }
     return parsed;
   }
@@ -323,14 +393,50 @@ class UtePortalClient {
   }
 
   async ensureIds(requiredKeys) {
-    const missing = requiredKeys.filter((key) => !this.ids[key]);
+    const missing = requiredKeys.filter((key) => !this.context[key]);
     if (!missing.length) return;
+    // El descubrimiento genérico toma el primer contexto que devuelve el
+    // portal. Con más de un suministro eso puede mezclar una cuenta con otra;
+    // en ese caso fallamos cerrados y pedimos que el descubrimiento de cartera
+    // entregue el contexto técnico completo del suministro elegido.
+    if (Number(this.context.portfolioSupplyCount || 0) > 1) {
+      const error = new Error(`Contexto técnico incompleto para el suministro seleccionado: ${missing.join(', ')}`);
+      error.code = 'MULTI_ACCOUNT_CONTEXT_INCOMPLETE';
+      throw error;
+    }
     await this.discoverIdentifiers();
-    const stillMissing = requiredKeys.filter((key) => !this.ids[key]);
+    const stillMissing = requiredKeys.filter((key) => !this.context[key]);
     if (stillMissing.length) {
       throw new Error(`Faltan identificadores UTE: ${stillMissing.join(', ')}`);
     }
   }
+}
+
+function parseUserTypeOptions(html) {
+  const source = String(html || '');
+  const options = [];
+  const blocks = source.match(/<(?:a|button|option|input|div)[^>]*(?:saId|spId|meterId|account|suministro|servicio)[^>]*>[^<]*|<(?:a|button|option|input|div)[^>]*>[^<]*(?:saId|spId|meterId|account|suministro|servicio)[^<]*/gi) || [];
+  const candidates = blocks.length ? blocks : [source];
+  candidates.forEach((block, index) => {
+    const ids = extractAccountIdentifiers(block);
+    const accountNumber = ids.accountNumber || block.match(/(?:accountNumber|cuenta)[^0-9]{0,10}(\d{6,})/i)?.[1] || null;
+    const label = stripHtml(block).replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (accountNumber || ids.saId || ids.spId || ids.meterId || /suministro|servicio|cuenta/i.test(label)) {
+      options.push({ index: index + 1, ids, accountNumber, label: label || `Opción ${index + 1}`, accountAlias: label || null, supplyAlias: label || null });
+    }
+  });
+  return dedupeOptions(options);
+}
+
+function stripHtml(value) { return String(value || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&'); }
+function dedupeOptions(options) {
+  const seen = new Set();
+  return options.filter((option) => {
+    const key = [option.accountNumber, option.ids.saId, option.ids.spId, option.ids.meterId, option.label].join('|');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function hasValidTotalsPayload(data) {
@@ -398,4 +504,4 @@ function loadEnvIfPresent(envPath) {
   }
 }
 
-module.exports = { UtePortalClient, BASE };
+module.exports = { UtePortalClient, BASE, parseUserTypeOptions };

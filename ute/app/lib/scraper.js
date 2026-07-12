@@ -13,7 +13,7 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs-extra');
 const { getChromiumLaunchOptions } = require('./runtime_env');
-const { discoverPortalContext } = require('./portal_context');
+const { discoverPortalContext, discoverPortfolio } = require('./portal_context');
 
 const BASE = 'https://autoservicio.ute.com.uy/SelfService/SSvcController';
 
@@ -59,6 +59,7 @@ class UTEScraper {
     this.browser  = null;
     this.page     = null;
     this.portalContext = null;
+    this.portfolio = null;
   }
 
   log(msg) {
@@ -86,7 +87,7 @@ class UTEScraper {
     await this.page.waitForTimeout(4000);
 
     let url = this.page.url();
-    if (isAuthenticationPage(url)) {
+    if (isAuthenticationPage(url) && !url.includes('navigateSelectUserType')) {
       await this.page.goto(`${BASE}/account`, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
       await this.page.waitForTimeout(2500);
       url = this.page.url();
@@ -97,6 +98,19 @@ class UTEScraper {
     }
     console.log('✅ Sesión iniciada');
     this.log(`Ruta post-login: ${safePortalUrl(url)}`);
+
+    if (url.includes('/navigateSelectUserType')) {
+      this.portfolio = await discoverPortfolio(this.page);
+      const supplies = this.portfolio.accounts.flatMap((account) => account.supplies || []);
+      if (supplies.length !== 1) {
+        const error = new Error('UTE requiere seleccionar explícitamente un suministro antes de sincronizar');
+        error.code = 'SUPPLY_SELECTION_REQUIRED';
+        error.portfolio = this.portfolio;
+        throw error;
+      }
+      this.portalContext = supplies[0].technical;
+      return;
+    }
 
     this.portalContext = await discoverPortalContext(this.page, { logger: msg => this.log(msg) });
     if (!this.portalContext.meterId || !this.portalContext.badge) {

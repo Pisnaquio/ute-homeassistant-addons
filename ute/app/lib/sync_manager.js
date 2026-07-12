@@ -21,7 +21,7 @@ class SyncManager {
   }
 
   empty() {
-    return { status: 'idle', id: null, kind: null, stage: null, startedAt: null, finishedAt: null, error: null, exitCode: null };
+    return { status: 'idle', id: null, kind: null, stage: null, supplyKey: null, startedAt: null, finishedAt: null, error: null, exitCode: null };
   }
 
   readState() {
@@ -53,8 +53,9 @@ class SyncManager {
   start(kind, args, env = process.env) {
     if (this.isRunning()) return null;
     const id = `sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    this.persist({ ...this.empty(), id, kind, status: 'queued', stage: 'starting', startedAt: new Date().toISOString() });
-    logEvent('info', 'sync.accepted', { job_id: id, kind });
+    const supplyKey = env.UTE_SUPPLY_KEY || (kind === 'sync-all' ? 'all' : null);
+    this.persist({ ...this.empty(), id, kind, supplyKey, status: 'queued', stage: 'starting', startedAt: new Date().toISOString() });
+    logEvent('info', 'sync.accepted', { job_id: id, kind, supplyKey });
 
     const child = spawn('node', ['ute_monitor.js', ...args], {
       cwd: this.cwd,
@@ -73,7 +74,7 @@ class SyncManager {
     child.stderr.on('data', chunk => forward('warn', chunk));
     child.once('error', error => {
       this.persist({ ...this.current, status: 'failed', stage: 'failed', finishedAt: new Date().toISOString(), exitCode: null, error: { code: 'SPAWN_FAILED', message: redact(error.message) } });
-      logEvent('error', 'sync.failed', { job_id: id, kind, code: 'SPAWN_FAILED' });
+      logEvent('error', 'sync.failed', { job_id: id, kind, supplyKey, code: 'SPAWN_FAILED' });
     });
     child.once('exit', code => {
       const succeeded = code === 0;
@@ -85,7 +86,7 @@ class SyncManager {
         exitCode: code,
         error: succeeded ? null : { code: 'SYNC_FAILED', message: 'La sincronización no se pudo completar. Revisá los logs o el diagnóstico.' },
       });
-      logEvent(succeeded ? 'info' : 'error', succeeded ? 'sync.succeeded' : 'sync.failed', { job_id: id, kind, exit_code: code });
+      logEvent(succeeded ? 'info' : 'error', succeeded ? 'sync.succeeded' : 'sync.failed', { job_id: id, kind, supplyKey, exit_code: code });
     });
     return this.getStatus();
   }

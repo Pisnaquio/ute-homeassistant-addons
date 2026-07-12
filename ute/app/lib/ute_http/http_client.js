@@ -57,7 +57,7 @@ class HttpClient {
 
         redirectCount += 1;
         if (redirectCount > 10) {
-          throw new Error(`Demasiados redirects al pedir ${url}`);
+          throw new Error('Demasiados redirects al pedir un endpoint autenticado');
         }
 
         const nextUrl = new URL(location, currentUrl).href;
