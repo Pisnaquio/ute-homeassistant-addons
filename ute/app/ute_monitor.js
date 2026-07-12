@@ -5,14 +5,15 @@ const path = require('path');
 const chalk = require('chalk');
 const schedule = require('node-schedule');
 
-const UTEScraper = require('./lib/scraper');
 const DataProcessor = require('./lib/processor');
 const DataAnalyzer = require('./lib/analyzer');
-const ReportGenerator = require('./lib/reporter');
 const { loadPeriodDetail, savePeriodDetail } = require('./lib/period_detail_store');
-const { ensureRuntimeDirs, runtimePaths } = require('./lib/runtime_env');
+const { createUteDataSource } = require('./lib/ute_data_source');
+const { ensureRuntimeDirs, runtimePaths, isAddonRuntime } = require('./lib/runtime_env');
+const { redact } = require('./lib/safe_log');
 
 const VERSION = '1.0.0';
+const VALID_PORTAL_SOURCE_MODES = new Set(['auto', 'http', 'playwright']);
 
 function parseYearMonth(text) {
   const match = String(text || '').match(/^(\d{4})-(\d{2})$/);
@@ -60,25 +61,30 @@ function parsePortalDate(text) {
   return { day: d, month: m, year: y };
 }
 
+function normalizePortalSourceMode(value) {
+  const mode = String(value || 'auto').toLowerCase();
+  return VALID_PORTAL_SOURCE_MODES.has(mode) ? mode : 'auto';
+}
+
 class UTEMonitor {
   constructor() {
     this.scraperEmail = process.env.UTE_EMAIL;
     this.scraperPassword = process.env.UTE_PASSWORD;
     this.debugMode = process.env.DEBUG === 'true';
+    this.portalSourceMode = normalizePortalSourceMode(process.env.UTE_SOURCE || process.env.UTE_PORTAL_TRANSPORT || 'auto');
     this.dataDir = runtimePaths.dataDir;
     this.reportDir = runtimePaths.reportDir;
     this.logDir = runtimePaths.logDir;
 
     this.processor = new DataProcessor(this.dataDir);
     this.analyzer = new DataAnalyzer();
-    this.reporter = new ReportGenerator(this.reportDir);
 
     ensureRuntimeDirs();
   }
 
   log(message, type = 'info') {
     const timestamp = new Date().toISOString();
-    const logMessage = `[${timestamp}] ${message}`;
+    const logMessage = `[${timestamp}] ${redact(message)}`;
 
     if (type === 'error') {
       console.error(chalk.red(logMessage));
@@ -101,15 +107,33 @@ class UTEMonitor {
 
   validateCredentials() {
     if (!this.scraperEmail || !this.scraperPassword) {
-      console.error(chalk.red.bold('\n❌ ERROR: Credenciales no configuradas\n'));
-      console.log(chalk.yellow('Para configurar las credenciales:'));
-      console.log(chalk.white('1. Si corrés esto dentro del app de Home Assistant, abrí Settings > Apps > UTE > Configuration'));
-      console.log(chalk.white('2. Cargá allí `ute_email` y `ute_password`'));
-      console.log(chalk.white('3. Si corrés fuera de Home Assistant, también podés usar variables de entorno:'));
-      console.log(chalk.cyan('   UTE_EMAIL=tu_email@example.com'));
-      console.log(chalk.cyan('   UTE_PASSWORD=tu_contraseña'));
-      console.log(chalk.white('\n4. Ejecutá nuevamente el comando.\n'));
-      process.exit(1);
+      const detail = isAddonRuntime
+        ? 'Configurá Usuario UTE / número de cuenta y contraseña en Settings > Apps > UTE > Configuration.'
+        : 'Configurá UTE_EMAIL (usuario o número de cuenta, no email) y UTE_PASSWORD en el entorno local.';
+      const error = new Error(`MISSING_CREDENTIALS: ${detail}`);
+      error.code = 'MISSING_CREDENTIALS';
+      throw error;
+    }
+  }
+
+  createDataSource() {
+    return createUteDataSource({
+      userId: this.scraperEmail,
+      password: this.scraperPassword,
+      debug: this.debugMode,
+      mode: this.portalSourceMode,
+    });
+  }
+
+  logSourceResult(result) {
+    if (!result) return;
+    const message =
+      `[UTE source] operation=${result.operation} selected=${result.source}` +
+      ` duration_ms=${result.durationMs}`;
+    if (result.fallbackFrom) {
+      console.log(chalk.yellow(`${message} fallback=${result.fallbackFrom}->${result.source} reason="${result.fallbackReason}"`));
+    } else {
+      console.log(chalk.gray(message));
     }
   }
 
@@ -124,15 +148,15 @@ class UTEMonitor {
   }
 
   async download() {
+    let source = null;
     try {
       console.log(chalk.bold.cyan('\n🌐 DESCARGANDO DATOS DE CONSUMO UTE\n'));
 
       this.validateCredentials();
-
-      const scraper = new UTEScraper(this.scraperEmail, this.scraperPassword, this.debugMode);
-
-      const rawData = await scraper.scrapeWithRetry();
-      await scraper.close();
+      source = this.createDataSource();
+      const monthlyResult = await source.fetchMonthlyData();
+      this.logSourceResult(monthlyResult);
+      const rawData = monthlyResult.data;
 
       if (rawData.length === 0) {
         throw new Error('No se obtuvieron datos del portal');
@@ -176,6 +200,8 @@ class UTEMonitor {
       this.log(`Error en descarga: ${error.message}`, 'error');
       console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
       throw error;
+    } finally {
+      if (source) await source.close().catch(() => {});
     }
   }
 
@@ -185,14 +211,15 @@ class UTEMonitor {
    * Playwright fuera del scraper completo.
    */
   async currentPeriod() {
+    let source = null;
     try {
       console.log(chalk.bold.cyan('\n⚡ ACTUALIZANDO PERÍODO ACTUAL\n'));
 
       this.validateCredentials();
-
-      const { fetchCurrentPeriod, close } = require('./lib/ute_session');
-      const data = await fetchCurrentPeriod();
-      await close();
+      source = this.createDataSource();
+      const currentResult = await source.fetchCurrentPeriod();
+      this.logSourceResult(currentResult);
+      const data = currentResult.data;
 
       const outPath = path.join(this.dataDir, 'periodo_actual.json');
       const fetchedAt = new Date().toISOString();
@@ -214,12 +241,15 @@ class UTEMonitor {
       this.log(`Error actualizando período actual: ${error.message}`, 'error');
       console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
       throw error;
+    } finally {
+      if (source) await source.close().catch(() => {});
     }
   }
 
   async periodDetail(periodoInicio, periodoFin, options = {}) {
     const jsonOnly = !!options.jsonOnly;
     const forceLive = !!options.forceLive;
+    let source = null;
     try {
       if (!jsonOnly) {
         console.log(chalk.bold.cyan('\n📅 CARGANDO DETALLE DIARIO DEL PERÍODO\n'));
@@ -242,14 +272,14 @@ class UTEMonitor {
       }
 
       this.validateCredentials();
-
-      const { fetchPeriodDetail, close } = require('./lib/ute_session');
       const historicalRecord = this.getHistoricalRecordFromPeriod(periodoFin);
-      const data = await fetchPeriodDetail(periodoInicio, periodoFin, {
+      source = this.createDataSource();
+      const detailResult = await source.fetchPeriodDetail(periodoInicio, periodoFin, {
         quiet: jsonOnly,
         fallbackTotals: historicalRecord
       });
-      await close();
+      if (!jsonOnly) this.logSourceResult(detailResult);
+      const data = detailResult.data;
       const storedAt = new Date().toISOString();
       savePeriodDetail(this.dataDir, data, { storedAt });
       const output = { ...data, fetched_at: storedAt, _source: 'live-fetch' };
@@ -272,10 +302,13 @@ class UTEMonitor {
         console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
       }
       throw error;
+    } finally {
+      if (source) await source.close().catch(() => {});
     }
   }
 
   async backfillPeriodDetails(startYm, endYm) {
+    let source = null;
     try {
       console.log(chalk.bold.cyan('\n🗂 BACKFILL DE DETALLE DIARIO POR PERÍODO\n'));
       const start = parseYearMonth(startYm);
@@ -288,8 +321,7 @@ class UTEMonitor {
       }
 
       this.validateCredentials();
-
-      const { fetchPeriodDetail, close } = require('./lib/ute_session');
+      source = this.createDataSource();
       const fetchedAt = new Date().toISOString();
       const results = { saved: 0, skipped: 0, failed: [] };
 
@@ -307,10 +339,12 @@ class UTEMonitor {
         try {
           console.log(chalk.cyan(`• ${label}: consultando UTE (${periodoInicio} → ${periodoFin})...`));
           const historicalRecord = this.getHistoricalRecord(item.year, item.month);
-          const detail = await fetchPeriodDetail(periodoInicio, periodoFin, {
+          const detailResult = await source.fetchPeriodDetail(periodoInicio, periodoFin, {
             quiet: true,
             fallbackTotals: historicalRecord
           });
+          this.logSourceResult(detailResult);
+          const detail = detailResult.data;
           const savedPath = savePeriodDetail(this.dataDir, detail, { storedAt: fetchedAt });
           if (!savedPath) {
             throw new Error('el período no pasó la validación para persistirse localmente');
@@ -322,8 +356,6 @@ class UTEMonitor {
           console.log(chalk.yellow(`  ⚠ No se pudo guardar ${label}: ${error.message}`));
         }
       }
-
-      await close();
 
       console.log(chalk.green(`\n✅ Backfill terminado: ${results.saved} guardados, ${results.skipped} ya existían, ${results.failed.length} fallaron.`));
       if (results.failed.length) {
@@ -338,6 +370,8 @@ class UTEMonitor {
       this.log(`Error en backfill de detalle diario: ${error.message}`, 'error');
       console.error(chalk.red(`\n❌ Error: ${error.message}\n`));
       throw error;
+    } finally {
+      if (source) await source.close().catch(() => {});
     }
   }
 
@@ -370,53 +404,6 @@ class UTEMonitor {
 
     } catch (error) {
       this.log(`Error en análisis: ${error.message}`, 'error');
-      console.error(chalk.red(`❌ Error: ${error.message}`));
-      throw error;
-    }
-  }
-
-  async report() {
-    try {
-      console.log(chalk.bold.cyan('\n📄 GENERANDO REPORTE\n'));
-      console.log(chalk.yellow('⚠️ `report` es una salida legacy. El dashboard vivo en http://localhost:3010 sigue siendo la vista principal.\n'));
-
-      // Cargar datos
-      const data = this.processor.loadExistingData();
-
-      if (data.length === 0) {
-        console.log(chalk.yellow('⚠️ No hay datos para generar reporte. Ejecuta: node ute_monitor.js download'));
-        return;
-      }
-
-      // Analizar
-      this.analyzer.setData(data);
-      const analysis = this.analyzer.getAnalysisSummary();
-
-      // Generar reporte para el mes actual
-      const now = new Date();
-      const year = now.getFullYear();
-      const month = now.getMonth() + 1;
-
-      console.log(`📅 Generando reporte para ${month}/${year}...\n`);
-
-      const reportFile = this.reporter.generateHTMLReport(data, analysis, year, month);
-
-      console.log(chalk.green(`✅ Reporte generado: ${reportFile}`));
-      this.log(`Reporte generado: ${reportFile}`);
-
-      // También generar reportes para últimos 12 meses
-      const last12 = data.slice(-12);
-      if (last12.length > 0) {
-        console.log('\n📊 Generando resumen de últimos 12 meses...');
-        const summary = { ...analysis, monthlySummary: this.analyzer.generateMonthlySummary() };
-        const summaryFile = this.reporter.generateHTMLReport(last12, summary, year, month);
-        console.log(chalk.green(`✅ Resumen guardado: ${summaryFile}`));
-      }
-
-      return reportFile;
-
-    } catch (error) {
-      this.log(`Error generando reporte: ${error.message}`, 'error');
       console.error(chalk.red(`❌ Error: ${error.message}`));
       throw error;
     }
@@ -529,10 +516,6 @@ class UTEMonitor {
         desc: 'Analizar datos y mostrar estadísticas'
       },
       {
-        cmd: 'report',
-        desc: 'Generar reporte HTML legacy con gráficos'
-      },
-      {
         cmd: 'schedule',
         desc: 'Activar descarga automática mensual'
       },
@@ -561,7 +544,6 @@ class UTEMonitor {
     console.log(chalk.bold('\nEJEMPLOS:\n'));
     console.log(chalk.white('  node ute_monitor.js download    # Descargar ahora'));
     console.log(chalk.white('  node ute_monitor.js analyze     # Analizar datos'));
-    console.log(chalk.white('  node ute_monitor.js report      # Generar reporte'));
     console.log(chalk.white('  node ute_monitor.js period-detail 27-04-2026 26-05-2026   # Curva diaria de un período'));
     console.log(chalk.white('  node ute_monitor.js backfill-period-details 2023-05 2026-05   # Cachear varios meses'));
     console.log(chalk.white('  node ute_monitor.js schedule    # Descargar automáticamente\n'));
@@ -587,10 +569,6 @@ class UTEMonitor {
 
       case 'analyze':
         await this.analyze();
-        break;
-
-      case 'report':
-        await this.report();
         break;
 
       case 'schedule':

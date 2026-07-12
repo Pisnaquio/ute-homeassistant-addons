@@ -36,7 +36,7 @@ function setEnvIfMissing(key, value) {
   }
 }
 
-setEnvIfMissing('UTE_EMAIL', addonOptions.ute_email);
+setEnvIfMissing('UTE_EMAIL', firstNonEmpty(addonOptions.ute_user, addonOptions.ute_email));
 setEnvIfMissing('UTE_PASSWORD', addonOptions.ute_password);
 setEnvIfMissing('DEBUG', addonOptions.debug === true ? 'true' : null);
 setEnvIfMissing('TZ', addonOptions.timezone);

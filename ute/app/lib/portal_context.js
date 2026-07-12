@@ -136,8 +136,17 @@ async function discoverPortalContext(page, options = {}) {
     context = mergeContext(context, extractContextFromText(curveSignals.combined));
   }
 
-  if (!context.saId || !context.spId) {
-    throw new Error('No se pudieron descubrir saId/spId desde el portal UTE');
+  if (context.saId && (!context.meterId || !context.badge)) {
+    const historyUrl =
+      `https://autoservicio.ute.com.uy/SelfService/SSvcController/cmhistorialconsumo?saId=${context.saId}`;
+    await page.goto(historyUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const historySignals = await collectPageSignals(page);
+    context = mergeContext(context, extractContextFromText(historySignals.combined));
+  }
+
+  if (!context.saId || !context.spId || !context.meterId || !context.badge) {
+    throw new Error('No se pudieron descubrir identificadores del suministro desde el portal UTE');
   }
 
   logger('[Portal Context] service identifiers discovered');

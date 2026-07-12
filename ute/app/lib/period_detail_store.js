@@ -66,7 +66,15 @@ function savePeriodDetail(baseDir, detail, meta = {}) {
     stored_at: meta.storedAt || new Date().toISOString()
   };
 
-  fs.writeJsonSync(filePath, payload, { spaces: 2 });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeJsonSync(tempPath, payload, { spaces: 2 });
+    const validated = fs.readJsonSync(tempPath);
+    if (!isUsablePeriodDetail(validated)) throw new Error('Detalle diario inválido.');
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (fs.existsSync(tempPath)) fs.removeSync(tempPath);
+  }
   return filePath;
 }
 
