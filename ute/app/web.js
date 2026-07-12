@@ -9,7 +9,9 @@ const { URUGUAY_HOLIDAYS } = require('./lib/uruguay_holidays');
 const { ensureRuntimeDirs, runtimePaths } = require('./lib/runtime_env');
 const { buildDisplayContext } = require('./lib/portal_context');
 const { SyncManager } = require('./lib/sync_manager');
-const { logEvent } = require('./lib/safe_log');
+const { logEvent, redact } = require('./lib/safe_log');
+const { RuntimeStorage } = require('./lib/runtime_storage');
+const { createUteDataSource } = require('./lib/ute_data_source');
 const CHART_BUNDLE = path.join(path.dirname(require.resolve('chart.js')), 'chart.umd.js');
 
 const app  = express();
@@ -17,18 +19,26 @@ const PORT = process.env.PORT || 3000;
 const DISPLAY_CONTEXT = buildDisplayContext();
 app.use(express.json());
 ensureRuntimeDirs();
+const runtimeStorage = new RuntimeStorage(runtimePaths);
+runtimeStorage.ensureSingleSupplyMigration();
 
 // ── Data helpers ─────────────────────────────────────────────────────────────
-const CONSUMO_PATH = path.join(runtimePaths.dataDir, 'consumo.json');
 const SYNC_STATE_PATH = path.join(runtimePaths.tempDir, 'sync-status.json');
 const PERIOD_DETAIL_CACHE = new Map();
-const PERIOD_DETAILS_DIR = path.join(runtimePaths.dataDir, 'periodos_detalle');
 const EXPORT_ALLOWLIST = Object.freeze({
   'consumo_ute_2024.xlsx': 'consumo_ute_2024.xlsx',
   'consumo_ute_2025.xlsx': 'consumo_ute_2025.xlsx',
   'consumo_ute_2026.xlsx': 'consumo_ute_2026.xlsx',
 });
 const SAFE_EXPORT_FILE_RE = /^[A-Za-z0-9._-]+$/;
+
+function activeDataDir() {
+  const supplyKey = runtimeStorage.loadSelectedSupplyKey();
+  return supplyKey ? runtimeStorage.getSupplyDataPath(supplyKey) : runtimePaths.dataDir;
+}
+function consumoPath() { return path.join(activeDataDir(), 'consumo.json'); }
+function periodoPath() { return path.join(activeDataDir(), 'periodo_actual.json'); }
+function periodDetailsDir() { return path.join(activeDataDir(), 'periodos_detalle'); }
 
 function normalizeExportFileName(rawName) {
   if (typeof rawName !== 'string' || !rawName.length) return null;
@@ -62,11 +72,11 @@ function resolveSafeExportPath(rawName) {
   const fileName = normalizeExportFileName(rawName);
   if (!fileName) return null;
 
-  const candidate = path.join(runtimePaths.dataDir, fileName);
+  const candidate = path.join(activeDataDir(), fileName);
   if (!fs.existsSync(candidate)) return null;
 
   try {
-    const dataRoot = fs.realpathSync(runtimePaths.dataDir);
+    const dataRoot = fs.realpathSync(activeDataDir());
     const realFile = fs.realpathSync(candidate);
     const relative = path.relative(dataRoot, realFile);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
@@ -95,16 +105,28 @@ function requireConfiguredCredentials(res) {
   return false;
 }
 
+function requireSelectedSupplyForMutation(res) {
+  const supplies = (runtimeStorage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
+  const selected = runtimeStorage.loadSelectedSupplyKey();
+  if (supplies.length > 1 && (!selected || !runtimeStorage.supplyExists(selected))) {
+    res.status(409).json({ error: 'SUPPLY_SELECTION_REQUIRED', message: 'Seleccioná un suministro antes de sincronizar.' });
+    return false;
+  }
+  if (supplies.length > 1 && !runtimeStorage.isSupplySyncReady(selected)) {
+    res.status(409).json({ error: 'MULTI_ACCOUNT_CONTEXT_INCOMPLETE', message: 'El suministro seleccionado todavía no tiene el contexto técnico completo para sincronizar.' });
+    return false;
+  }
+  return true;
+}
+
 function loadHistorical() {
-  try { return JSON.parse(fs.readFileSync(CONSUMO_PATH, 'utf8')); }
+  try { return JSON.parse(fs.readFileSync(consumoPath(), 'utf8')); }
   catch(e) { return []; }
 }
 
-const PERIODO_PATH = path.join(runtimePaths.dataDir, 'periodo_actual.json');
-
 function loadPeriodoActual() {
   try {
-    return JSON.parse(fs.readFileSync(PERIODO_PATH, 'utf8'));
+    return JSON.parse(fs.readFileSync(periodoPath(), 'utf8'));
   } catch(e) {
     return null;
   }
@@ -112,13 +134,14 @@ function loadPeriodoActual() {
 
 function loadPeriodDetailIndex() {
   try {
-    if (!fs.existsSync(PERIOD_DETAILS_DIR)) return [];
-    const files = fs.readdirSync(PERIOD_DETAILS_DIR)
+    const detailsDir = periodDetailsDir();
+    if (!fs.existsSync(detailsDir)) return [];
+    const files = fs.readdirSync(detailsDir)
       .filter(name => /^\d{4}-\d{2}\.json$/.test(name))
       .sort();
 
     return files.map(name => {
-      const fullPath = path.join(PERIOD_DETAILS_DIR, name);
+      const fullPath = path.join(detailsDir, name);
       const parsed = fs.readJsonSync(fullPath);
       const endDate = parsePortalDateServer(parsed.periodo_fin);
       return {
@@ -144,9 +167,38 @@ function parsePortalDateServer(text) {
 const syncManager = new SyncManager({ cwd: __dirname, statePath: SYNC_STATE_PATH });
 const AUTO_CURRENT_REFRESH_MAX_AGE_MS = 8 * 60 * 60 * 1000;
 const AUTO_CURRENT_REFRESH_CHECK_MS = 3 * 60 * 60 * 1000;
+let nextAutoRefreshAt = 0;
 
 function startSync(kind, args) {
-  return syncManager.start(kind, args, process.env);
+  const supplyKey = runtimeStorage.loadSelectedSupplyKey();
+  const env = { ...process.env };
+  if (supplyKey) env.UTE_SUPPLY_KEY = supplyKey;
+  return syncManager.start(kind, args, env);
+}
+
+function toClientPortfolio(portfolio) {
+  return {
+    schemaVersion: portfolio.schemaVersion,
+    generatedAt: portfolio.generatedAt,
+    source: portfolio.source,
+    accounts: (portfolio.accounts || []).map((account) => ({
+      accountKey: account.accountKey,
+      alias: account.alias,
+      supplies: (account.supplies || []).map((supply) => ({
+        supplyKey: supply.supplyKey,
+        alias: supply.alias,
+        location: supply.location,
+        capabilities: supply.capabilities,
+        tariffs: supply.tariffs,
+        meters: (supply.meters || []).map((meter) => ({
+          meterKey: meter.meterKey,
+          label: meter.label,
+          type: meter.type,
+          status: meter.status,
+        })),
+      })),
+    })),
+  };
 }
 
 // ── API routes ────────────────────────────────────────────────────────────────
@@ -161,6 +213,83 @@ app.get('/api/config-status', (req, res) => {
     credentials_configured: credentialsConfigured,
     login_required: !credentialsConfigured
   });
+});
+
+app.get('/api/portfolio', (_req, res) => {
+  const portfolio = runtimeStorage.getPortfolio();
+  if (!portfolio) return res.status(404).json({ error: 'portfolio_not_discovered', login_required: !hasConfiguredCredentials() });
+  return res.json({ ...toClientPortfolio(portfolio), selectedSupplyKey: runtimeStorage.loadSelectedSupplyKey() });
+});
+
+app.get('/api/supplies', (_req, res) => {
+  const portfolio = runtimeStorage.getPortfolio();
+  if (!portfolio) return res.json({ supplies: [], selectedSupplyKey: null, selectionRequired: false, source: null });
+  const supplies = portfolio.accounts.flatMap((account) => (account.supplies || []).map((supply) => ({
+    supplyKey: supply.supplyKey,
+    accountKey: account.accountKey,
+    accountAlias: account.alias,
+    alias: supply.alias,
+    location: supply.location,
+    syncReady: runtimeStorage.isSupplySyncReady(supply.supplyKey),
+    capabilities: supply.capabilities,
+    meters: (supply.meters || []).map((meter) => ({
+      meterKey: meter.meterKey,
+      label: meter.label,
+      type: meter.type,
+      status: meter.status,
+    })),
+  })));
+  const selectedSupplyKey = runtimeStorage.loadSelectedSupplyKey();
+  return res.json({
+    supplies,
+    selectedSupplyKey,
+    selectionRequired: supplies.length > 1 && (!selectedSupplyKey || !runtimeStorage.supplyExists(selectedSupplyKey) || !runtimeStorage.isSupplySyncReady(selectedSupplyKey)),
+    source: portfolio.source,
+  });
+});
+
+app.post('/api/supply/select', (req, res) => {
+  const supplyKey = runtimeStorage.resolveSupplyKey(req.body?.supplyKey);
+  if (!supplyKey || !runtimeStorage.supplyExists(supplyKey)) return res.status(400).json({ error: 'invalid_supply_key' });
+  if (!runtimeStorage.isSupplySyncReady(supplyKey)) {
+    return res.status(409).json({ error: 'MULTI_ACCOUNT_CONTEXT_INCOMPLETE', message: 'Ese suministro todavía no tiene el contexto técnico completo para sincronizar.' });
+  }
+  runtimeStorage.setSelectedSupplyKey(supplyKey);
+  PERIOD_DETAIL_CACHE.clear();
+  return res.json({ ok: true, selectedSupplyKey: supplyKey });
+});
+
+app.post('/api/portfolio/refresh', async (_req, res) => {
+  if (!requireConfiguredCredentials(res)) return;
+  const source = createUteDataSource({ userId: process.env.UTE_EMAIL, password: process.env.UTE_PASSWORD, mode: process.env.UTE_SOURCE || 'auto' });
+  try {
+    const portfolio = await source.discoverPortfolio();
+    const stored = runtimeStorage.savePortfolio(portfolio);
+    runtimeStorage.getOrCreateSelectedSupply(stored);
+    PERIOD_DETAIL_CACHE.clear();
+    return res.json({ ok: true, portfolio: toClientPortfolio(stored), selectedSupplyKey: runtimeStorage.loadSelectedSupplyKey() });
+  } catch (error) {
+    return res.status(error.code === 'SUPPLY_SELECTION_REQUIRED' ? 409 : 502).json({
+      error: error.code || 'portfolio_discovery_failed',
+      message: redact(error.message),
+    });
+  } finally {
+    await source.close().catch(() => {});
+  }
+});
+
+app.delete('/api/supply/:supplyKey', (req, res) => {
+  const supplyKey = runtimeStorage.resolveSupplyKey(req.params.supplyKey);
+  if (!supplyKey || !runtimeStorage.supplyExists(supplyKey)) return res.status(404).json({ error: 'supply_not_found' });
+  if (!runtimeStorage.removeSupply(supplyKey)) return res.status(404).json({ error: 'supply_not_found' });
+  return res.json({ ok: true, selectedSupplyKey: runtimeStorage.loadSelectedSupplyKey() });
+});
+
+app.get('/api/diagnostic/download', (_req, res) => {
+  const diagnostic = runtimeStorage.exportDiagnostic(runtimeStorage.loadSelectedSupplyKey());
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('content-disposition', 'attachment; filename="ute-diagnostic.json"');
+  return res.send(JSON.stringify(diagnostic, null, 2));
 });
 
 app.get('/api/sync-status', (_req, res) => {
@@ -198,12 +327,12 @@ app.get('/api/period-detail', (req, res) => {
     return res.status(400).json({ error: 'Parámetros inválidos. Usá start y end en formato DD-MM-YYYY.' });
   }
 
-  const cacheKey = `${start}|${end}`;
+  const cacheKey = `${runtimeStorage.loadSelectedSupplyKey() || 'legacy'}|${start}|${end}`;
   if (PERIOD_DETAIL_CACHE.has(cacheKey)) {
     return res.json(PERIOD_DETAIL_CACHE.get(cacheKey));
   }
 
-  const local = loadPeriodDetail(runtimePaths.dataDir, start, end);
+  const local = loadPeriodDetail(activeDataDir(), start, end);
   if (local) {
     PERIOD_DETAIL_CACHE.set(cacheKey, local);
     return res.json(local);
@@ -216,7 +345,7 @@ app.get('/api/period-detail', (req, res) => {
       ...closedPrev,
       _source: 'current-snapshot'
     };
-    savePeriodDetail(runtimePaths.dataDir, closedPrev, { storedAt: current?.fetched_at || new Date().toISOString() });
+    savePeriodDetail(activeDataDir(), closedPrev, { storedAt: current?.fetched_at || new Date().toISOString() });
     PERIOD_DETAIL_CACHE.set(cacheKey, stored);
     return res.json(stored);
   }
@@ -232,6 +361,7 @@ app.post('/api/refresh', (req, res) => {
   if (!hasConfiguredCredentials()) {
     return res.status(428).json(missingCredentialsPayload());
   }
+  if (!requireSelectedSupplyForMutation(res)) return;
 
   const job = startSync('download', ['download']);
   if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
@@ -243,10 +373,22 @@ app.post('/api/refresh-current', (req, res) => {
   if (!hasConfiguredCredentials()) {
     return res.status(428).json(missingCredentialsPayload());
   }
+  if (!requireSelectedSupplyForMutation(res)) return;
 
   const job = startSync('current', ['current']);
   if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
   return res.status(202).json({ message: 'Actualización de período actual aceptada.', job });
+});
+
+app.post('/api/refresh-all', (req, res) => {
+  if (!hasConfiguredCredentials()) return res.status(428).json(missingCredentialsPayload());
+  const portfolio = runtimeStorage.getPortfolio();
+  const supplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
+  if (!supplies.length || portfolio.source === 'legacy-single-supply') return res.status(409).json({ error: 'portfolio_not_discovered' });
+  const env = { ...process.env, UTE_SYNC_ALL: 'true' };
+  const job = syncManager.start('sync-all', ['sync-all'], env);
+  if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
+  return res.status(202).json({ message: 'Sincronización de todos los suministros aceptada.', job, supplyCount: supplies.length });
 });
 
 app.get('/api/ha/summary', (req, res) => {
@@ -286,6 +428,9 @@ app.get('/vendor/chart.umd.js', (_req, res) => {
 // con refrescar el periodo actual unas pocas veces por dia.
 setInterval(() => {
   if (!hasConfiguredCredentials()) return;
+  if (Date.now() < nextAutoRefreshAt) return;
+  const supplies = (runtimeStorage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
+  if (supplies.length > 1 && !runtimeStorage.loadSelectedSupplyKey()) return;
   if (syncManager.isRunning()) return;
 
   const data = loadPeriodoActual();
@@ -295,11 +440,14 @@ setInterval(() => {
   if (ageMs > AUTO_CURRENT_REFRESH_MAX_AGE_MS) {
     logEvent('info', 'sync.auto_requested', { kind: 'current' });
     startSync('current-auto', ['current']);
+    nextAutoRefreshAt = Date.now() + AUTO_CURRENT_REFRESH_CHECK_MS + Math.floor(Math.random() * 15 * 60 * 1000);
   }
 }, AUTO_CURRENT_REFRESH_CHECK_MS);
 
 function scheduleInitialSync() {
   if (!hasConfiguredCredentials() || syncManager.isRunning()) return;
+  const supplies = (runtimeStorage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
+  if (supplies.length > 1 && !runtimeStorage.loadSelectedSupplyKey()) return;
   const hasHistory = loadHistorical().length > 0;
   const hasCurrent = Boolean(loadPeriodoActual());
   if (hasHistory && hasCurrent) return;
@@ -1023,6 +1171,7 @@ const HTML = `<!DOCTYPE html>
         <div class="current-period" id="currentPeriod">Cargando datos del portal UTE…</div>
       </div>
       <div class="current-header-right">
+        <select class="filter-select current-select" id="supplySelector" onchange="selectSupply(this.value)" aria-label="Suministro UTE" hidden></select>
         <select class="filter-select current-select" id="dailyPeriodSel" onchange="onDailyPeriodChange(this.value)">
           <option value="current">⚡ Período actual</option>
         </select>
@@ -1040,6 +1189,7 @@ const HTML = `<!DOCTYPE html>
             </button>
           </div>
         </details>
+        <a class="btn btn-primary" href="api/diagnostic/download" download="ute-diagnostic.json" title="Descargar diagnóstico anonimizado">Diagnóstico</a>
       </div>
     </div>
     <div id="refreshStatus" class="sync-status"></div>
@@ -1150,6 +1300,7 @@ let dailyDetailRequestId = 0;
 let DAILY_PERIOD_INDEX = [];
 let CONFIG_STATUS = { credentials_configured: true, login_required: false };
 let SYNC_BUSY = false;
+let PORTFOLIO_SUPPLIES = [];
 const URUGUAY_HOLIDAYS = ${JSON.stringify(URUGUAY_HOLIDAYS)};
 const URUGUAY_HOLIDAY_SET = new Set(URUGUAY_HOLIDAYS);
 
@@ -1174,6 +1325,66 @@ function setLoginRequiredUi(required) {
     syncMenu.setAttribute('aria-disabled', required ? 'true' : 'false');
     if (required) syncMenu.open = false;
   }
+}
+
+async function loadSupplies() {
+  let response = await fetch('api/supplies');
+  let payload = await response.json();
+  if (!payload.supplies?.length || payload.source === 'legacy-single-supply') {
+    const refreshed = await fetch('api/portfolio/refresh', { method: 'POST' });
+    if (refreshed.ok) {
+      response = await fetch('api/supplies');
+      payload = await response.json();
+    } else {
+      const detail = await refreshed.json().catch(() => ({}));
+      payload.discoveryError = detail.error || 'portfolio_discovery_failed';
+    }
+  }
+  PORTFOLIO_SUPPLIES = payload.supplies || [];
+  const selector = document.getElementById('supplySelector');
+  if (!selector) return payload;
+  selector.innerHTML = '';
+  if (payload.selectionRequired) {
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'Seleccioná un suministro…';
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    selector.appendChild(placeholder);
+  }
+  PORTFOLIO_SUPPLIES.forEach((supply) => {
+    const option = document.createElement('option');
+    option.value = supply.supplyKey;
+    option.textContent = (supply.accountAlias || supply.accountNumber || 'Cuenta') + ' · ' + (supply.alias || supply.location || supply.supplyKey) + (supply.syncReady ? '' : ' (no disponible)');
+    option.disabled = !supply.syncReady;
+    option.selected = supply.supplyKey === payload.selectedSupplyKey;
+    selector.appendChild(option);
+  });
+  selector.hidden = PORTFOLIO_SUPPLIES.length < 2;
+  return payload;
+}
+
+async function selectSupply(supplyKey) {
+  if (!supplyKey) return;
+  const response = await fetch('api/supply/select', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ supplyKey }) });
+  if (!response.ok) { document.getElementById('refreshStatus').textContent = 'No se pudo seleccionar el suministro'; return; }
+  document.getElementById('refreshStatus').textContent = 'Suministro seleccionado';
+  window.location.reload();
+}
+
+function renderSelectionRequired(payload) {
+  setLoginRequiredUi(true);
+  document.getElementById('currentPeriod').textContent = 'Seleccioná un suministro para continuar';
+  document.getElementById('currentContent').className = 'current-loading';
+  document.getElementById('currentContent').innerHTML = '<div class="login-card"><div class="login-eyebrow">Portfolio UTE</div><h2>Elegí el suministro</h2><p>El portal devolvió más de un suministro. Elegí uno en el selector para evitar sincronizar la cuenta equivocada.</p></div>';
+  document.getElementById('refreshStatus').textContent = 'Hay ' + (payload.supplies || []).length + ' suministros disponibles';
+}
+
+function renderDiscoveryError() {
+  document.getElementById('currentPeriod').textContent = 'No se pudieron descubrir los suministros';
+  document.getElementById('currentContent').className = 'current-loading';
+  document.getElementById('currentContent').innerHTML = '<div class="login-card"><div class="login-eyebrow">Conexión UTE</div><h2>Necesitamos revisar el acceso</h2><p>El portal no devolvió una cuenta utilizable. Descargá el diagnóstico anonimizado y compartilo con soporte; tu contraseña y tus identificadores no se incluyen.</p><p><a href="api/diagnostic/download" download="ute-diagnostic.json">Descargar diagnóstico</a></p></div>';
+  document.getElementById('refreshStatus').textContent = 'Discovery incompleto';
 }
 
 function clearHistoricalUi() {
@@ -1399,6 +1610,16 @@ async function init() {
     populateFilterSelects();
     populateDailyPeriodSelect();
     renderLoginRequired();
+    return;
+  }
+
+  const supplies = await loadSupplies().catch(() => ({ supplies: [], selectionRequired: false }));
+  if (supplies.discoveryError && !(supplies.supplies || []).length) {
+    renderDiscoveryError();
+    return;
+  }
+  if (supplies.selectionRequired) {
+    renderSelectionRequired(supplies);
     return;
   }
 

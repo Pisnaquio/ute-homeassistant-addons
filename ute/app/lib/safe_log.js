@@ -1,7 +1,7 @@
 'use strict';
 
-const SENSITIVE_QUERY_KEYS = /([?&](?:saId|spId|meterId|badge|psId|userId|password|token|access_token|refresh_token|id_token|state|nonce|code)=)[^&#\s]+/gi;
-const SENSITIVE_ASSIGNMENTS = /\b(?:UTE_EMAIL|UTE_PASSWORD|ute_email|ute_password|saId|spId|meterId|badge|psId|userId|password|token|access_token|refresh_token|id_token|state|nonce|code|authorization|cookie)\s*[:=]\s*[^\s,;]+/gi;
+const SENSITIVE_QUERY_KEYS = /([?&](?:saId|spId|meterId|badge|psId|userId|accountNumber|password|token|access_token|refresh_token|id_token|state|nonce|code)=)[^&#\s]+/gi;
+const SENSITIVE_ASSIGNMENTS = /\b(?:UTE_EMAIL|UTE_PASSWORD|ute_email|ute_password|saId|spId|meterId|badge|psId|userId|accountNumber|password|token|access_token|refresh_token|id_token|state|nonce|code|authorization|cookie)\s*[:=]\s*[^\s,;]+/gi;
 
 function valuesFromEnvironment(env = process.env) {
   return [
@@ -32,7 +32,7 @@ function logEvent(level, event, fields = {}) {
     ts: new Date().toISOString(),
     level,
     event,
-    ...Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, redact(value)])),
+    ...Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, redactValue(value)])),
   };
   const line = JSON.stringify(payload);
   if (level === 'error') console.error(line);
@@ -40,4 +40,15 @@ function logEvent(level, event, fields = {}) {
   else console.log(line);
 }
 
-module.exports = { logEvent, redact };
+function redactValue(value) {
+  if (Array.isArray(value)) return value.map(redactValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+      if (/password|token|cookie|authorization|userId|accountNumber|saId|spId|meterId|badge|psId/i.test(key)) return [key, '[REDACTED]'];
+      return [key, redactValue(item)];
+    }));
+  }
+  return redact(value);
+}
+
+module.exports = { logEvent, redact, redactValue };
