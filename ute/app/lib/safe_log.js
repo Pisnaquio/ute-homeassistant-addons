@@ -1,7 +1,7 @@
 'use strict';
 
-const SENSITIVE_QUERY_KEYS = /([?&](?:saId|spId|meterId|badge|psId|userId|password|token|access_token|refresh_token)=)[^&#\s]+/gi;
-const SENSITIVE_ASSIGNMENTS = /\b(?:UTE_EMAIL|UTE_PASSWORD|ute_email|ute_password|saId|spId|meterId|badge|psId|userId|password|token|access_token|refresh_token|authorization|cookie)\s*[:=]\s*[^\s,;]+/gi;
+const SENSITIVE_QUERY_KEYS = /([?&](?:saId|spId|meterId|badge|psId|userId|password|token|access_token|refresh_token|id_token|state|nonce|code)=)[^&#\s]+/gi;
+const SENSITIVE_ASSIGNMENTS = /\b(?:UTE_EMAIL|UTE_PASSWORD|ute_email|ute_password|saId|spId|meterId|badge|psId|userId|password|token|access_token|refresh_token|id_token|state|nonce|code|authorization|cookie)\s*[:=]\s*[^\s,;]+/gi;
 
 function valuesFromEnvironment(env = process.env) {
   return [

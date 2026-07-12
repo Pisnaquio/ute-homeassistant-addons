@@ -37,6 +37,20 @@ async function hasLoggedInContent(page) {
   );
 }
 
+function isAuthenticationPage(url) {
+  const normalized = String(url || '').toLowerCase();
+  return normalized.includes('/login') || normalized.includes('/account/login');
+}
+
+function safePortalUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return 'URL no disponible';
+  }
+}
+
 class UTEScraper {
   constructor(userId, password, debug = false) {
     this.userId   = userId;
@@ -72,17 +86,17 @@ class UTEScraper {
     await this.page.waitForTimeout(4000);
 
     let url = this.page.url();
-    if (url.includes('/login')) {
+    if (isAuthenticationPage(url)) {
       await this.page.goto(`${BASE}/account`, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      await this.page.waitForTimeout(2000);
+      await this.page.waitForTimeout(2500);
       url = this.page.url();
     }
     const loggedInContent = await hasLoggedInContent(this.page);
-    if (url.includes('/login') && !loggedInContent) {
-      throw new Error('Login fallido — verificar credenciales');
+    if (isAuthenticationPage(url) && !loggedInContent) {
+      throw new Error('Login no confirmado — verificar usuario/número de cuenta y contraseña en el portal UTE');
     }
     console.log('✅ Sesión iniciada');
-    this.log(`URL post-login: ${url}`);
+    this.log(`Ruta post-login: ${safePortalUrl(url)}`);
 
     this.portalContext = await discoverPortalContext(this.page, { logger: msg => this.log(msg) });
     if (!this.portalContext.meterId || !this.portalContext.badge) {
