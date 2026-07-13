@@ -10,7 +10,7 @@ const DataAnalyzer = require('./lib/analyzer');
 const { loadPeriodDetail, savePeriodDetail } = require('./lib/period_detail_store');
 const { createUteDataSource } = require('./lib/ute_data_source');
 const { ensureRuntimeDirs, runtimePaths, isAddonRuntime } = require('./lib/runtime_env');
-const { redact } = require('./lib/safe_log');
+const { redact, logEvent } = require('./lib/safe_log');
 const { RuntimeStorage } = require('./lib/runtime_storage');
 
 const VERSION = '1.0.0';
@@ -18,6 +18,15 @@ const VALID_PORTAL_SOURCE_MODES = new Set(['auto', 'http', 'playwright']);
 
 function safeErrorMessage(error) {
   return redact(error?.message || error || 'error desconocido');
+}
+
+function logPortalDiagnostic(operation, error) {
+  if (!error?.diagnostic) return;
+  logEvent('warn', 'portal.discovery.diagnostic', {
+    operation,
+    code: error.code || 'DISCOVERY_FAILED',
+    ...error.diagnostic,
+  });
 }
 
 function parseYearMonth(text) {
@@ -265,6 +274,7 @@ class UTEMonitor {
       return mergedData;
 
     } catch (error) {
+      logPortalDiagnostic('monthly', error);
       this.log(`Error en descarga: ${error.message}`, 'error');
       console.error(chalk.red(`\n❌ Error: ${safeErrorMessage(error)}\n`));
       throw error;
@@ -333,6 +343,7 @@ class UTEMonitor {
       return data;
 
     } catch (error) {
+      logPortalDiagnostic('current', error);
       this.log(`Error actualizando período actual: ${error.message}`, 'error');
       console.error(chalk.red(`\n❌ Error: ${safeErrorMessage(error)}\n`));
       throw error;

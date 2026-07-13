@@ -17,6 +17,7 @@ const {
   tryParseJson,
 } = require('./parsers');
 const { normalizePortalIdentity } = require('../portfolio_contract');
+const { logEvent } = require('../safe_log');
 
 const BASE = 'https://autoservicio.ute.com.uy/SelfService/SSvcController';
 const MIN_MONTHLY_HISTORY_MONTHS = 26;
@@ -79,6 +80,15 @@ class UtePortalClient {
   async discoverPortfolio() {
     const html = this.userTypePage || (await this.fetchAccountPage());
     const options = this.userTypeOptions || parseUserTypeOptions(html);
+    const diagnostic = buildDiscoveryDiagnostic(html, options);
+    logEvent('info', 'portal.discovery.parsed', diagnostic);
+    if (!options.length) {
+      const error = new Error('DISCOVERY_OPTIONS_UNPARSEABLE: UTE inició sesión, pero no se pudieron enumerar los suministros. Revisá los logs de diagnóstico.');
+      error.code = 'DISCOVERY_OPTIONS_UNPARSEABLE';
+      error.diagnostic = diagnostic;
+      logEvent('warn', 'portal.discovery.failed', { code: error.code, ...diagnostic });
+      throw error;
+    }
     const accountGroups = new Map();
     for (const option of options) {
       const ids = mergeIdentifiers({}, option.ids || {});
@@ -112,6 +122,11 @@ class UtePortalClient {
     }
     const portfolio = normalizePortalIdentity({ source: 'ute-portal', accounts: [...accountGroups.values()] });
     const supplies = portfolio.accounts.flatMap((account) => account.supplies);
+    logEvent('info', 'portal.discovery.ready', {
+      ...diagnostic,
+      supply_count: supplies.length,
+      complete_context_count: supplies.filter((supply) => ['saId', 'spId', 'meterId', 'badge'].every((key) => Boolean(supply.technical?.[key]))).length,
+    });
     if (supplies.length === 1) this.setSupplyContext(supplies[0].technical);
     return portfolio;
   }
@@ -450,6 +465,19 @@ function extractServiceRouteOptions(source) {
   const raw = String(source || '').replace(/&amp;/gi, '&');
   const routeMatches = [...raw.matchAll(/cmvisualizarcurvadecarga\?[^"'\\\s<]+/gi)].map((match) => match[0]);
   return [...new Set(routeMatches)];
+}
+
+function buildDiscoveryDiagnostic(html, options) {
+  const source = String(html || '');
+  return {
+    stage: 'navigate_select_user_type',
+    page_marker_present: /navigateSelectUserType/i.test(source),
+    account_marker_present: /n(?:u|ú)mero\s+de\s+cuenta|acuerdos?\s+de\s+servicio/i.test(source),
+    service_route_count: extractServiceRouteOptions(source).length,
+    option_count: Array.isArray(options) ? options.length : 0,
+    option_with_sa_sp_count: (options || []).filter((option) => option?.ids?.saId && option?.ids?.spId).length,
+    html_length_bucket: source.length === 0 ? 'empty' : source.length < 2000 ? 'small' : source.length < 20000 ? 'medium' : 'large',
+  };
 }
 
 function dedupeOptions(options) {
