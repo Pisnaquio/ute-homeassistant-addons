@@ -4,8 +4,25 @@ const UTEScraper = require('./scraper');
 const { isUsablePeriodDetail } = require('./period_detail_store');
 const { UtePortalClient } = require('./ute_http/portal_client');
 const { redact } = require('./safe_log');
+const {
+  CURRENT_DISCOVERY_REVISION,
+  normalizePortalIdentity,
+} = require('./portfolio_contract');
 
 const VALID_SOURCE_MODES = new Set(['auto', 'http', 'playwright']);
+const DISCOVERY_FAIL_CLOSED_CODES = new Set([
+  'INVALID_CREDENTIALS',
+  'SESSION_EXPIRED',
+  'USER_TYPE_SELECTION_REQUIRED',
+  'USER_TYPE_SELECTION_UNPARSEABLE',
+  'DISCOVERY_OPTIONS_UNPARSEABLE',
+  'DISCOVERY_FAILED',
+  'ACCOUNT_PAGE_UNAVAILABLE',
+  'CHALLENGE_UNSUPPORTED',
+  'PORTFOLIO_CONTEXT_INCOMPLETE',
+  'PORTFOLIO_IDENTITY_AMBIGUOUS',
+  'PORTFOLIO_IDENTITY_CONFLICT',
+]);
 
 function createUteDataSource(options) {
   return new UteDataSource(options);
@@ -20,16 +37,49 @@ class UteDataSource {
     this.supplyContext = options.supplyContext || null;
     this.httpClient = null;
     this.playwrightSessionTouched = false;
+    this.playwrightScraperFactory = options.playwrightScraperFactory || (() =>
+      new UTEScraper(this.userId, this.password, this.debug));
   }
 
   async discoverPortfolio() {
-    const client = await this.getHttpClient({ allowUnselected: true });
-    const portfolio = this.portfolio || await client.discoverPortfolio();
-    this.portfolio = portfolio;
-    if (!portfolio?.accounts?.length) {
-      throw new Error('UTE no devolvió cuentas ni suministros');
+    if (this.mode === 'playwright') return this.discoverPortfolioWithPlaywright(null);
+    try {
+      const client = await this.getHttpClient({ allowUnselected: true });
+      const portfolio = this.portfolio || await client.discoverPortfolio();
+      this.portfolio = portfolio;
+      if (!portfolio?.accounts?.length) throw new Error('UTE no devolvió cuentas ni suministros');
+      return portfolio;
+    } catch (error) {
+      if (this.mode === 'http') throw error;
+      if (DISCOVERY_FAIL_CLOSED_CODES.has(error.code)) throw error;
+      return this.discoverPortfolioWithPlaywright(error);
     }
-    return portfolio;
+  }
+
+  async discoverPortfolioWithPlaywright(httpError) {
+    const scraper = this.playwrightScraperFactory();
+    try {
+      await scraper.initialize();
+      await scraper.login();
+      if (scraper.portfolio?.accounts?.length) {
+        this.portfolio = finalizePlaywrightPortfolio(scraper.portfolio);
+        return this.portfolio;
+      }
+      const error = new Error('Playwright no enumeró una cartera de suministros verificable; no se eligió el primer contexto automáticamente.');
+      error.code = 'PLAYWRIGHT_DISCOVERY_UNVERIFIED';
+      throw error;
+    } catch (error) {
+      if (error?.portfolio?.accounts?.length) {
+        this.portfolio = finalizePlaywrightPortfolio(error.portfolio);
+        return this.portfolio;
+      }
+      if (!error.code) error.code = httpError?.code || 'DISCOVERY_FAILED';
+      error.fallbackFrom = 'http';
+      error.fallbackReason = summarizeError(httpError);
+      throw error;
+    } finally {
+      await scraper.close();
+    }
   }
 
   async fetchMonthlyData(options = {}) {
@@ -45,7 +95,7 @@ class UteDataSource {
         return wrapParsedRows(data);
       },
       async () => {
-        const scraper = new UTEScraper(this.userId, this.password, this.debug);
+        const scraper = new UTEScraper(this.userId, this.password, this.debug, this.supplyContext);
         try {
           return await scraper.scrapeWithRetry();
         } finally {
@@ -70,7 +120,7 @@ class UteDataSource {
       async () => {
         this.playwrightSessionTouched = true;
         const { fetchCurrentPeriod } = require('./ute_session');
-        const data = await fetchCurrentPeriod(options);
+        const data = await fetchCurrentPeriod({ ...options, supplyContext: this.supplyContext });
         if (!isUsablePeriodDetail(data)) {
           throw new Error('Playwright devolvió período actual incompleto');
         }
@@ -94,7 +144,7 @@ class UteDataSource {
       async () => {
         this.playwrightSessionTouched = true;
         const { fetchPeriodDetail } = require('./ute_session');
-        const data = await fetchPeriodDetail(periodoInicio, periodoFin, options);
+        const data = await fetchPeriodDetail(periodoInicio, periodoFin, { ...options, supplyContext: this.supplyContext });
         if (!isUsablePeriodDetail(data)) {
           throw new Error('Playwright devolvió detalle diario inválido');
         }
@@ -143,8 +193,8 @@ class UteDataSource {
   async runOperation(operation, httpFn, playwrightFn) {
     const startedAt = Date.now();
     if (this.mode === 'playwright') {
-      if (this.hasMultiSupplyContext()) {
-        const error = new Error('Playwright no está habilitado para portfolios multicuenta: usá el conector HTTP');
+      if (this.hasMultiSupplyContext() && !this.hasCompleteSupplyContext()) {
+        const error = new Error('Playwright requiere el contexto técnico completo del suministro seleccionado.');
         error.code = 'MULTI_ACCOUNT_PLAYWRIGHT_UNSUPPORTED';
         throw error;
       }
@@ -158,7 +208,7 @@ class UteDataSource {
       if (this.mode === 'http') {
         throw error;
       }
-      if (this.hasMultiSupplyContext()) {
+      if (this.hasMultiSupplyContext() && !this.hasCompleteSupplyContext()) {
         if (!error.code) error.code = 'MULTI_ACCOUNT_HTTP_FAILED';
         error.fallbackSuppressed = true;
         throw error;
@@ -176,6 +226,11 @@ class UteDataSource {
     return Number(this.supplyContext?.portfolioSupplyCount || 0) > 1;
   }
 
+  hasCompleteSupplyContext() {
+    const technical = this.supplyContext?.technical || this.supplyContext || {};
+    return ['saId', 'spId', 'meterId', 'badge'].every((key) => Boolean(technical[key]));
+  }
+
   wrapResult(operation, source, data, startedAt, extra = {}) {
     return {
       data,
@@ -185,6 +240,34 @@ class UteDataSource {
       ...extra,
     };
   }
+}
+
+function finalizePlaywrightPortfolio(rawPortfolio) {
+  const evidence = rawPortfolio?.discoveryEvidence || {};
+  if (evidence.enumerated !== true || evidence.canonicalized !== true) {
+    const error = new Error('Playwright no aportó evidencia de enumeración completa de suministros.');
+    error.code = 'PLAYWRIGHT_DISCOVERY_UNVERIFIED';
+    throw error;
+  }
+  const portfolio = normalizePortalIdentity({
+    ...rawPortfolio,
+    discoveryRevision: CURRENT_DISCOVERY_REVISION,
+  });
+  const supplies = (portfolio.accounts || []).flatMap((account) => account.supplies || []);
+  if (Number(evidence.candidateCount || 0) !== supplies.length) {
+    const error = new Error('La evidencia Playwright no coincide con los suministros enumerados.');
+    error.code = 'PLAYWRIGHT_DISCOVERY_UNVERIFIED';
+    throw error;
+  }
+  if (supplies.length !== 1 || !hasCompleteTechnicalContext(supplies[0]?.technical)) {
+    const error = new Error('Playwright no pudo demostrar una identidad única y completa del suministro.');
+    error.code = supplies.length > 1
+      ? 'PLAYWRIGHT_MULTI_ACCOUNT_UNVERIFIED'
+      : 'PORTFOLIO_CONTEXT_INCOMPLETE';
+    throw error;
+  }
+  supplies[0].selectedByDefault = true;
+  return portfolio;
 }
 
 function normalizeMode(value) {
@@ -205,7 +288,12 @@ function summarizeError(error) {
   return redact(String(error && error.message ? error.message : error || 'error desconocido')).slice(0, 240);
 }
 
+function hasCompleteTechnicalContext(context) {
+  return ['saId', 'spId', 'meterId', 'badge'].every((key) => Boolean(context?.[key]));
+}
+
 module.exports = {
   UteDataSource,
   createUteDataSource,
+  finalizePlaywrightPortfolio,
 };

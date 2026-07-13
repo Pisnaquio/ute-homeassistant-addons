@@ -4,6 +4,7 @@ const DEFAULT_ACCOUNT_LABEL = 'Cuenta personal UTE';
 const DEFAULT_LOCATION_LABEL = 'Configuracion pendiente';
 const DEFAULT_PLAN_LABEL = 'Tarifa configurable';
 const { normalizePortalIdentity } = require('./portfolio_contract');
+const { canonicalizeDiscoveryCandidates, parseUserTypeOptions } = require('./ute_http/portal_client');
 
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -166,46 +167,53 @@ async function discoverPortfolio(page, options = {}) {
     });
   }
 
-  const rawOptions = await page.$$eval('a,button,option,input,li,div', nodes => nodes.map((node, index) => ({
-    index,
-    text: (node.innerText || node.textContent || node.value || '').replace(/\s+/g, ' ').trim(),
-    html: node.outerHTML || '',
-  })).filter(item => /cuenta|suministro|servicio|saId|spId|meterId/i.test(`${item.text} ${item.html}`)));
-  const optionsFound = rawOptions.map((item, index) => {
-    const context = extractContextFromText(`${item.text}\n${item.html}`);
-    return {
-      index: index + 1,
-      label: item.text || `Opción ${index + 1}`,
-      accountNumber: context.accountNumber,
-      accountAlias: item.text || null,
-      supplyAlias: item.text || null,
-      ...context,
-    };
-  }).filter(item => item.accountNumber || item.saId || item.spId || item.meterId);
-
-  const unique = [];
-  const seen = new Set();
-  for (const item of optionsFound) {
-    const key = [item.accountNumber, item.saId, item.spId, item.meterId, item.label].join('|');
-    if (!seen.has(key)) { seen.add(key); unique.push(item); }
+  const html = await page.content();
+  const parsedOptions = parseUserTypeOptions(html);
+  const canonical = canonicalizeDiscoveryCandidates(parsedOptions);
+  if (canonical.errorCode) {
+    const error = new Error('Playwright encontró opciones de suministro ambiguas o contradictorias.');
+    error.code = canonical.errorCode;
+    throw error;
   }
-  if (!unique.length) throw new Error('La pantalla navigateSelectUserType no contiene opciones enumerables');
-  const accounts = unique.map(item => ({
-    accountNumber: item.accountNumber || `opcion-${item.index}`,
-    accountAlias: item.accountAlias || item.label,
-    supplies: [{
-      alias: item.supplyAlias || item.label,
-      location: item.locationLabel || 'Ubicación no disponible',
-      saId: item.saId,
-      spId: item.spId,
-      meterId: item.meterId,
-      badge: item.badge,
-      meters: item.meterId ? [{ id: item.meterId, label: 'Medidor principal', type: 'electricity', status: 'unknown' }] : [],
-      capabilities: { hasAMI: Boolean(item.meterId), supportsMaxDemand: false, supportsDailyDetail: Boolean(item.spId), canEstimateTRT: true },
-      selectedByDefault: unique.length === 1,
-    }],
-  }));
-  return normalizePortalIdentity({ source: 'ute-portal', accounts });
+  if (!canonical.candidates.length) {
+    const error = new Error('La pantalla navigateSelectUserType no contiene opciones enumerables');
+    error.code = 'PLAYWRIGHT_DISCOVERY_UNVERIFIED';
+    throw error;
+  }
+
+  const grouped = new Map();
+  for (const item of canonical.candidates) {
+    const ids = item.ids || {};
+    const accountNumber = item.accountNumber || ids.accountNumber || `opcion-${item.index}`;
+    if (!grouped.has(accountNumber)) {
+      grouped.set(accountNumber, {
+        accountNumber,
+        accountAlias: item.accountAlias || item.label || `Cuenta ${accountNumber}`,
+        supplies: [],
+      });
+    }
+    grouped.get(accountNumber).supplies.push({
+      alias: item.supplyAlias || item.label || `Suministro ${item.index}`,
+      location: item.location || 'Ubicación no disponible',
+      saId: ids.saId,
+      spId: ids.spId,
+      meterId: ids.meterId,
+      badge: ids.badge,
+      meters: ids.meterId ? [{ id: ids.meterId, label: 'Medidor principal', type: 'electricity', status: 'unknown' }] : [],
+      capabilities: { hasAMI: Boolean(ids.meterId), supportsMaxDemand: false, supportsDailyDetail: Boolean(ids.spId), canEstimateTRT: true },
+      selectedByDefault: canonical.candidates.length === 1,
+    });
+  }
+  const accounts = [...grouped.values()];
+  return {
+    ...normalizePortalIdentity({ source: 'ute-portal-playwright', accounts }),
+    discoveryEvidence: {
+      enumerated: true,
+      canonicalized: true,
+      parsedCandidateCount: parsedOptions.length,
+      candidateCount: canonical.candidates.length,
+    },
+  };
 }
 
 module.exports = {

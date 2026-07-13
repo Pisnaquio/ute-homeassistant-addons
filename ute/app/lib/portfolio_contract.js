@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 
 const SCHEMA_VERSION = '2.0.0';
+const CURRENT_DISCOVERY_REVISION = 2;
 
 function normalizeString(value) {
   return String(value || '').trim();
@@ -111,6 +112,9 @@ function normalizeAccount(raw) {
 function normalizePortalIdentity(raw) {
   return {
     schemaVersion: SCHEMA_VERSION,
+    discoveryRevision: Number.isInteger(Number(raw?.discoveryRevision))
+      ? Number(raw.discoveryRevision)
+      : 0,
     generatedAt: normalizeString(raw?.generatedAt) || new Date().toISOString(),
     source: normalizeString(raw?.source || 'unknown'),
     userHints: {
@@ -261,6 +265,7 @@ function validatePortalIdentity(portfolio) {
 
 module.exports = {
   SCHEMA_VERSION,
+  CURRENT_DISCOVERY_REVISION,
   computeStableKey,
   normalizePortalIdentity,
   normalizeAccount,

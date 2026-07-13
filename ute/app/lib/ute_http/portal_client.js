@@ -16,11 +16,24 @@ const {
   shiftMonth,
   tryParseJson,
 } = require('./parsers');
-const { normalizePortalIdentity } = require('../portfolio_contract');
+const {
+  CURRENT_DISCOVERY_REVISION,
+  normalizePortalIdentity,
+} = require('../portfolio_contract');
 const { logEvent } = require('../safe_log');
+const {
+  STATES,
+  buildSafeFormSubmission,
+  classifyPostLoginPage,
+  extractJsRedirect,
+  inspectForms,
+  isSafePortalUrl,
+  safePortalUrl,
+} = require('./post_login_state');
 
 const BASE = 'https://autoservicio.ute.com.uy/SelfService/SSvcController';
 const MIN_MONTHLY_HISTORY_MONTHS = 26;
+const MAX_POST_LOGIN_STEPS = 4;
 
 class UtePortalClient {
   constructor(options = {}) {
@@ -28,7 +41,7 @@ class UtePortalClient {
 
     this.userId = options.userId || process.env.UTE_USER_ID || process.env.UTE_EMAIL;
     this.password = options.password || process.env.UTE_PASSWORD;
-    this.client = new HttpClient();
+    this.client = options.client || new HttpClient();
     this.context = Object.freeze({
       saId: options.saId || process.env.UTE_SA_ID || null,
       spId: options.spId || process.env.UTE_SP_ID || null,
@@ -44,31 +57,68 @@ class UtePortalClient {
       throw new Error('Faltan credenciales UTE_USER_ID/UTE_EMAIL y UTE_PASSWORD');
     }
 
-    await this.client.get(`${BASE}/login`);
-    const response = await this.client.postForm(`${BASE}/authenticate`, {
-      userId: this.userId,
-      password: this.password,
-    }, {
-      headers: {
-        referer: `${BASE}/login`,
-      },
-    });
+    const loginPage = await this.client.get(`${BASE}/login`);
+    const form = inspectForms(loginPage.text, loginPage.url).find((candidate) =>
+      candidate.fieldNames.includes('userId') && candidate.fieldNames.includes('password'));
+    const submission = form ? buildSafeFormSubmission(form) : null;
+    const values = submission?.ok ? submission.values : {};
+    values.userId = this.userId;
+    values.password = this.password;
+    const action = submission?.ok ? submission.action : `${BASE}/authenticate`;
+    let response = await this.submitForm({ method: submission?.method || 'POST', action, values }, `${BASE}/login`);
 
-    const loggedIn = this.isLoggedInText(response.text);
-    if (response.url && response.url.includes('/navigateSelectUserType')) {
-      this.userTypePage = response.text;
-      this.userTypeOptions = parseUserTypeOptions(response.text);
-      return response;
-    }
-    if (!loggedIn) {
-      const account = await this.client.get(`${BASE}/account`);
-      if (!this.isLoggedInText(account.text)) {
-        throw new Error('Login HTTP fallido - verificar credenciales o flujo del portal');
+    for (let step = 0; step <= MAX_POST_LOGIN_STEPS; step += 1) {
+      const diagnostic = classifyPostLoginPage(response, { afterAuthentication: true });
+      this.lastPostLoginDiagnostic = diagnostic;
+      logEvent('info', 'portal.post_login.classified', { operation: 'login', step, ...diagnostic });
+
+      if (diagnostic.state === STATES.ACCOUNT) return response;
+      if (diagnostic.state === STATES.USER_TYPE_SELECTION) {
+        this.userTypePage = response.text;
+        this.userTypeOptions = parseUserTypeOptions(response.text);
+        if (this.userTypeOptions.length) return response;
+        const transition = this.findSafeFormTransition(response);
+        if (!transition.ok) {
+          throw this.portalError(
+            transition.reason === 'selection_required' ? 'USER_TYPE_SELECTION_REQUIRED' : 'USER_TYPE_SELECTION_UNPARSEABLE',
+            'login',
+            diagnostic
+          );
+        }
+        response = await this.submitForm(transition.submission, response.url);
+        continue;
       }
-      return account;
+      if (diagnostic.state === STATES.JS_REDIRECT_OR_AUTOSUBMIT) {
+        const transition = this.findSafeScriptTransition(response);
+        if (!transition.ok) throw this.portalError('CHALLENGE_UNSUPPORTED', 'login', diagnostic);
+        response = await this.submitForm(transition.submission, response.url);
+        continue;
+      }
+      if (diagnostic.state === STATES.AUTHENTICATED_INTERMEDIATE) {
+        response = await this.client.get(`${BASE}/account`);
+        continue;
+      }
+      if (diagnostic.state === STATES.LOGIN_FORM) {
+        throw this.portalError('INVALID_CREDENTIALS', 'login', diagnostic);
+      }
+      if (diagnostic.state === STATES.SESSION_EXPIRED) {
+        throw this.portalError('SESSION_EXPIRED', 'login', diagnostic, true);
+      }
+      if (diagnostic.state === STATES.PORTAL_MAINTENANCE) {
+        throw this.portalError('PORTAL_MAINTENANCE', 'login', diagnostic, true);
+      }
+      if (diagnostic.state === STATES.PORTAL_ERROR) {
+        throw this.portalError('PORTAL_UNAVAILABLE', 'login', diagnostic, true);
+      }
+      if (diagnostic.state === STATES.CHALLENGE_OR_UNSUPPORTED) {
+        throw this.portalError('CHALLENGE_UNSUPPORTED', 'login', diagnostic);
+      }
+      if (diagnostic.state === STATES.HTTP_REDIRECT_PENDING) {
+        throw this.portalError('REDIRECT_LOOP', 'login', diagnostic, true);
+      }
+      throw this.portalError('DISCOVERY_FAILED', 'login', diagnostic, true);
     }
-
-    return response;
+    throw this.portalError('REDIRECT_LOOP', 'login', this.lastPostLoginDiagnostic, true);
   }
 
   /**
@@ -80,29 +130,77 @@ class UtePortalClient {
   async discoverPortfolio() {
     const html = this.userTypePage || (await this.fetchAccountPage());
     const options = this.userTypeOptions || parseUserTypeOptions(html);
-    const diagnostic = buildDiscoveryDiagnostic(html, options);
+    const diagnostic = buildDiscoveryDiagnostic(html, options, this.lastPostLoginDiagnostic);
     logEvent('info', 'portal.discovery.parsed', diagnostic);
     if (!options.length) {
-      const error = new Error('DISCOVERY_OPTIONS_UNPARSEABLE: UTE inició sesión, pero no se pudieron enumerar los suministros. Revisá los logs de diagnóstico.');
-      error.code = 'DISCOVERY_OPTIONS_UNPARSEABLE';
-      error.diagnostic = diagnostic;
+      const error = this.portalError('DISCOVERY_OPTIONS_UNPARSEABLE', 'discovery', diagnostic, true);
       logEvent('warn', 'portal.discovery.failed', { code: error.code, ...diagnostic });
       throw error;
     }
-    const accountGroups = new Map();
+    const enrichedOptions = [];
     for (const option of options) {
       const ids = mergeIdentifiers({}, option.ids || {});
       let enriched = ids;
       if (ids.saId && ids.spId) {
         try {
-          enriched = mergeIdentifiers(enriched, extractAccountIdentifiers(await this.fetchCurvePage(ids.saId, ids.spId)));
-        } catch (_) { /* opción visible pero curva temporalmente no disponible */ }
+          enriched = mergeDiscoveryIdentifiersOrThrow(
+            enriched,
+            extractAccountIdentifiers(await this.fetchCurvePage(ids.saId, ids.spId))
+          );
+        } catch (error) {
+          if (error.code === 'PORTFOLIO_IDENTITY_CONFLICT') throw error;
+          /* opción visible pero curva temporalmente no disponible */
+        }
       }
       if (enriched.saId && (!enriched.meterId || !enriched.badge)) {
         try {
-          enriched = mergeIdentifiers(enriched, extractAccountIdentifiers(await this.fetchConsumptionHistoryPage(enriched.saId)));
-        } catch (_) { /* conservar la opción para diagnóstico */ }
+          enriched = mergeDiscoveryIdentifiersOrThrow(
+            enriched,
+            extractAccountIdentifiers(await this.fetchConsumptionHistoryPage(enriched.saId))
+          );
+        } catch (error) {
+          if (error.code === 'PORTFOLIO_IDENTITY_CONFLICT') throw error;
+          /* conservar la opción para diagnóstico */
+        }
       }
+      enrichedOptions.push({
+        ...option,
+        ids: enriched,
+        accountNumber: option.accountNumber || enriched.accountNumber || null,
+      });
+    }
+
+    const canonical = canonicalizeDiscoveryCandidates(enrichedOptions);
+    logEvent('info', 'portal.discovery.canonicalized', {
+      raw_candidate_count: options.length,
+      service_candidate_count: canonical.serviceCandidateCount,
+      metadata_candidate_count: canonical.metadataCandidateCount,
+      canonical_supply_count: canonical.canonicalCandidateCount,
+      duplicates_collapsed_count: canonical.duplicatesCollapsedCount,
+      ambiguous_count: canonical.ambiguousCount,
+    });
+    if (canonical.errorCode) {
+      const error = this.portalError(canonical.errorCode, 'discovery', {
+        ...diagnostic,
+        ambiguous_count: canonical.ambiguousCount,
+        identity_conflict_count: canonical.identityConflictCount,
+      });
+      logEvent('warn', 'portal.discovery.identity_failed', {
+        code: error.code,
+        ambiguous_count: canonical.ambiguousCount,
+        identity_conflict_count: canonical.identityConflictCount,
+      });
+      throw error;
+    }
+    if (!canonical.candidates.length) {
+      const error = this.portalError('DISCOVERY_OPTIONS_UNPARSEABLE', 'discovery', diagnostic, true);
+      logEvent('warn', 'portal.discovery.failed', { code: error.code, ...diagnostic });
+      throw error;
+    }
+
+    const accountGroups = new Map();
+    for (const option of canonical.candidates) {
+      const enriched = option.ids;
       const accountNumber = option.accountNumber || enriched.accountNumber || `opcion-${option.index}`;
       const accountId = option.accountId || accountNumber;
       const key = `${accountId}`;
@@ -117,10 +215,14 @@ class UtePortalClient {
         meters: enriched.meterId ? [{ id: enriched.meterId, label: 'Medidor principal', type: 'electricity', status: 'unknown' }] : [],
         capabilities: { hasAMI: Boolean(enriched.meterId), supportsMaxDemand: false, supportsDailyDetail: Boolean(enriched.spId), canEstimateTRT: true },
         tariffs: [],
-        selectedByDefault: options.length === 1,
+        selectedByDefault: canonical.candidates.length === 1,
       });
     }
-    const portfolio = normalizePortalIdentity({ source: 'ute-portal', accounts: [...accountGroups.values()] });
+    const portfolio = normalizePortalIdentity({
+      source: 'ute-portal',
+      discoveryRevision: CURRENT_DISCOVERY_REVISION,
+      accounts: [...accountGroups.values()],
+    });
     const supplies = portfolio.accounts.flatMap((account) => account.supplies);
     logEvent('info', 'portal.discovery.ready', {
       ...diagnostic,
@@ -148,10 +250,76 @@ class UtePortalClient {
 
   async fetchAccountPage() {
     const response = await this.client.get(`${BASE}/account`);
-    if (!this.isLoggedInText(response.text)) {
-      throw new Error('Sesion no valida al pedir /account');
+    const diagnostic = classifyPostLoginPage(response, { afterAuthentication: true });
+    this.lastPostLoginDiagnostic = diagnostic;
+    if (diagnostic.state !== STATES.ACCOUNT) {
+      const code = diagnostic.state === STATES.LOGIN_FORM || diagnostic.state === STATES.SESSION_EXPIRED
+        ? 'SESSION_EXPIRED'
+        : diagnostic.state === STATES.PORTAL_MAINTENANCE
+          ? 'PORTAL_MAINTENANCE'
+          : 'ACCOUNT_PAGE_UNAVAILABLE';
+      throw this.portalError(code, 'discovery', diagnostic, code !== 'SESSION_EXPIRED');
     }
     return response.text;
+  }
+
+  findSafeFormTransition(response) {
+    const forms = inspectForms(response.text, response.url);
+    const submissions = forms
+      .map((form) => buildSafeFormSubmission(form))
+      .filter((candidate) => candidate.ok);
+    if (submissions.length !== 1) {
+      return { ok: false, reason: submissions.length > 1 ? 'selection_required' : 'unparseable' };
+    }
+    return { ok: true, submission: submissions[0] };
+  }
+
+  findSafeScriptTransition(response) {
+    const redirect = extractJsRedirect(response.text);
+    if (redirect) {
+      const action = safePortalUrl(redirect, response.url);
+      if (action && isSafePortalUrl(action)) return { ok: true, submission: { method: 'GET', action, values: {} } };
+      return { ok: false, reason: 'unsafe_redirect' };
+    }
+    return this.findSafeFormTransition(response);
+  }
+
+  async submitForm(submission, referer) {
+    if (!submission?.action || !isSafePortalUrl(submission.action)) {
+      throw this.portalError('USER_TYPE_SELECTION_UNPARSEABLE', 'login', this.lastPostLoginDiagnostic);
+    }
+    const headers = { referer };
+    if (submission.method === 'GET') {
+      const url = new URL(submission.action);
+      Object.entries(submission.values || {}).forEach(([key, value]) => url.searchParams.set(key, value));
+      return this.client.get(url.href, { headers });
+    }
+    return this.client.postForm(submission.action, submission.values || {}, { headers });
+  }
+
+  portalError(code, operation, diagnostic, retryable = false) {
+    const messages = {
+      INVALID_CREDENTIALS: 'UTE no pudo validar las credenciales. Revisá usuario/número de cuenta y contraseña.',
+      SESSION_EXPIRED: 'La sesión de UTE venció durante la operación. Volvé a intentar.',
+      USER_TYPE_SELECTION_REQUIRED: 'UTE requiere una selección de perfil que no se puede decidir automáticamente.',
+      USER_TYPE_SELECTION_UNPARSEABLE: 'UTE mostró una selección de perfil que esta versión no pudo interpretar de forma segura.',
+      ACCOUNT_PAGE_UNAVAILABLE: 'UTE no entregó una página de cuenta utilizable.',
+      DISCOVERY_FAILED: 'UTE no devolvió una pantalla autenticada reconocible para descubrir los suministros.',
+      DISCOVERY_OPTIONS_UNPARSEABLE: 'UTE no devolvió opciones de suministro interpretables. Revisá el diagnóstico seguro.',
+      PORTAL_UNAVAILABLE: 'El portal UTE devolvió un error temporal. Probá nuevamente más tarde.',
+      PORTAL_MAINTENANCE: 'El portal UTE está en mantenimiento.',
+      CHALLENGE_UNSUPPORTED: 'UTE solicitó un paso interactivo no compatible con la sincronización automática.',
+      PORTFOLIO_IDENTITY_AMBIGUOUS: 'UTE devolvió referencias ambiguas que podrían pertenecer a más de un suministro. No se eligió ninguna automáticamente.',
+      PORTFOLIO_IDENTITY_CONFLICT: 'UTE devolvió identificadores contradictorios para un mismo suministro. La sincronización se bloqueó para evitar mezclar datos.',
+      REDIRECT_LOOP: 'UTE redirigió demasiadas veces durante el inicio de sesión.',
+    };
+    const error = new Error(messages[code] || 'No se pudo completar la operación con UTE.');
+    error.code = code;
+    error.operation = operation;
+    error.stage = diagnostic?.state || STATES.UNKNOWN;
+    error.retryable = retryable;
+    error.diagnostic = diagnostic || null;
+    return error;
   }
 
   async discoverIdentifiers() {
@@ -430,14 +598,36 @@ class UtePortalClient {
 function parseUserTypeOptions(html) {
   const source = String(html || '');
   const options = [];
-  const blocks = source.match(/<(?:a|button|option|input|div)[^>]*(?:saId|spId|meterId|account|suministro|servicio)[^>]*>[^<]*|<(?:a|button|option|input|div)[^>]*>[^<]*(?:saId|spId|meterId|account|suministro|servicio)[^<]*/gi) || [];
+  const blocks = source.match(/<(?:a|button|option|input|div|li)[^>]*(?:saId|spId|meterId|account|cuenta|suministro|servicio)[^>]*>[^<]*|<(?:a|button|option|input|div|li)[^>]*>[^<]*(?:saId|spId|meterId|account|cuenta|suministro|servicio)[^<]*/gi) || [];
   const candidates = blocks.length ? blocks : [source];
   candidates.forEach((block, index) => {
     const ids = extractAccountIdentifiers(block);
     const accountNumber = ids.accountNumber || block.match(/(?:accountNumber|cuenta)[^0-9]{0,10}(\d{6,})/i)?.[1] || null;
     const label = stripHtml(block).replace(/\s+/g, ' ').trim().slice(0, 120);
+    const tagName = block.match(/^\s*<\s*([a-z0-9]+)/i)?.[1]?.toLowerCase() || '';
+    const openingTag = block.match(/^\s*<[^>]+>/)?.[0] || '';
+    const explicitActionable = ['a', 'button', 'option', 'input', 'li'].includes(tagName) ||
+      /\b(?:onclick|onchange|onmousedown|onkeydown|tabindex|data-(?:action|target|value|id|account|supply|service))\s*=/i.test(openingTag) ||
+      /\brole\s*=\s*["']?(?:button|link|option|menuitem|radio)/i.test(openingTag);
+    const hasTechnicalIdentity = Boolean(ids.saId || ids.spId || ids.meterId || ids.badge);
+    const isAccountHeader = tagName === 'div' && /^n[uú]mero de cuenta\s*:?[\s\d-]*$/i.test(label);
+    const isGlobalHeader = tagName === 'div' && /^(?:mis servicios|acuerdos de servicio)$/i.test(label);
+    const knownMetadata = isGlobalHeader || (isAccountHeader && Boolean(accountNumber));
+    // No podemos observar listeners registrados desde JavaScript externo. Por
+    // eso todo bloque no identificado que parezca una cuenta/suministro se
+    // considera ambiguo, salvo headers decorativos conocidos y acotados.
+    const actionable = explicitActionable || (!hasTechnicalIdentity && !knownMetadata);
     if (accountNumber || ids.saId || ids.spId || ids.meterId || /suministro|servicio|cuenta/i.test(label)) {
-      options.push({ index: index + 1, ids, accountNumber, label: label || `Opción ${index + 1}`, accountAlias: label || null, supplyAlias: label || null });
+      options.push({
+        index: index + 1,
+        ids,
+        accountNumber,
+        label: label || `Opción ${index + 1}`,
+        accountAlias: label || null,
+        supplyAlias: label || null,
+        actionable,
+        metadataKind: isAccountHeader ? 'account-header' : isGlobalHeader ? 'global-header' : null,
+      });
     }
   });
   // Algunas cuentas llegan a navigateSelectUserType con las opciones dentro
@@ -454,6 +644,7 @@ function parseUserTypeOptions(html) {
       label: `Suministro detectado ${index + 1}`,
       accountAlias: null,
       supplyAlias: null,
+      actionable: true,
     });
   });
   return dedupeOptions(options);
@@ -467,16 +658,35 @@ function extractServiceRouteOptions(source) {
   return [...new Set(routeMatches)];
 }
 
-function buildDiscoveryDiagnostic(html, options) {
+function buildDiscoveryDiagnostic(html, options, postLoginDiagnostic = null) {
   const source = String(html || '');
+  const classified = postLoginDiagnostic || classifyPostLoginPage({ text: source });
   return {
-    stage: 'navigate_select_user_type',
-    page_marker_present: /navigateSelectUserType/i.test(source),
-    account_marker_present: /n(?:u|ú)mero\s+de\s+cuenta|acuerdos?\s+de\s+servicio/i.test(source),
-    service_route_count: extractServiceRouteOptions(source).length,
-    option_count: Array.isArray(options) ? options.length : 0,
+    stage: classified.state === STATES.USER_TYPE_SELECTION ? 'navigate_select_user_type' : classified.state,
+    status_code: classified.statusCode,
+    content_type: classified.contentType,
+    pathname: classified.pathname,
+    redirect_pathnames: classified.redirectPathnames,
+    form_count: classified.formCount,
+    form_methods: classified.formMethods,
+    form_action_pathnames: classified.formActionPathnames,
+    field_names: classified.fieldNames,
+    select_count: classified.selectCount,
+    option_count: Array.isArray(options) ? options.length : classified.optionCount,
     option_with_sa_sp_count: (options || []).filter((option) => option?.ids?.saId && option?.ids?.spId).length,
-    html_length_bucket: source.length === 0 ? 'empty' : source.length < 2000 ? 'small' : source.length < 20000 ? 'medium' : 'large',
+    link_count: classified.linkCount,
+    script_count: classified.scriptCount,
+    login_marker_present: classified.loginMarkerPresent,
+    page_marker_present: classified.selectionMarkerPresent,
+    account_marker_present: classified.accountMarkerPresent,
+    error_marker_present: classified.errorMarkerPresent,
+    maintenance_marker_present: classified.maintenanceMarkerPresent,
+    js_redirect_present: classified.jsRedirectPresent,
+    auto_submit_present: classified.autoSubmitPresent,
+    html_length_bucket: classified.htmlLengthBucket,
+    title_class: classified.titleClass,
+    body_fingerprint: classified.bodyFingerprint,
+    service_route_count: extractServiceRouteOptions(source).length,
   };
 }
 
@@ -489,6 +699,202 @@ function dedupeOptions(options) {
     seen.add(key);
     return true;
   });
+}
+
+const DISCOVERY_IDENTITY_KEYS = Object.freeze(['saId', 'spId', 'meterId', 'badge']);
+
+function canonicalizeDiscoveryCandidates(options) {
+  const opaqueActionableCandidates = (options || [])
+    .filter((option) => option?.actionable && !hasAnyTechnicalIdentity(option?.ids));
+  const serviceCandidates = (options || [])
+    .filter((option) => hasAnyTechnicalIdentity(option?.ids))
+    .map(cloneDiscoveryCandidate)
+    .sort(compareCandidateStrength);
+  const metadataCandidateCount = Math.max(0, (options || []).length - serviceCandidates.length - opaqueActionableCandidates.length);
+  const accountHeaders = (options || []).filter((option) => option?.metadataKind === 'account-header');
+  const primary = serviceCandidates.filter((candidate) => hasPrimaryIdentity(candidate.ids));
+  const partial = serviceCandidates.filter((candidate) => !hasPrimaryIdentity(candidate.ids));
+  const clusters = [];
+  const unresolvedSecondary = [];
+  let identityConflictCount = 0;
+  let ambiguousCount = opaqueActionableCandidates.length;
+  let mergeCount = 0;
+
+  for (const candidate of primary) {
+    const match = clusters.find((cluster) => samePrimaryIdentity(cluster.ids, candidate.ids));
+    if (!match) {
+      clusters.push(candidate);
+      continue;
+    }
+    if (hasIdentityConflict(match, candidate)) {
+      identityConflictCount += 1;
+      continue;
+    }
+    mergeDiscoveryCandidate(match, candidate);
+    mergeCount += 1;
+  }
+
+  if (identityConflictCount) {
+    return canonicalizationResult('PORTFOLIO_IDENTITY_CONFLICT', clusters);
+  }
+
+  for (let leftIndex = 0; leftIndex < clusters.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < clusters.length; rightIndex += 1) {
+      if (primaryClustersConflict(clusters[leftIndex], clusters[rightIndex])) identityConflictCount += 1;
+    }
+  }
+  if (identityConflictCount) {
+    return canonicalizationResult('PORTFOLIO_IDENTITY_CONFLICT', clusters);
+  }
+
+  for (const candidate of partial) {
+    const sharedWith = clusters.filter((cluster) => sharedIdentityCount(cluster.ids, candidate.ids) > 0);
+    const conflicting = sharedWith.filter((cluster) => hasIdentityConflict(cluster, candidate));
+    if (conflicting.length) {
+      identityConflictCount += 1;
+      continue;
+    }
+    const compatible = sharedWith.filter((cluster) => identitiesCompatible(cluster, candidate));
+    if (compatible.length === 1) {
+      mergeDiscoveryCandidate(compatible[0], candidate);
+      mergeCount += 1;
+      continue;
+    }
+    if (compatible.length > 1) {
+      ambiguousCount += 1;
+      continue;
+    }
+    if (hasSecondaryIdentity(candidate.ids)) {
+      const secondaryMatch = unresolvedSecondary.find((cluster) =>
+        sameSecondaryIdentity(cluster.ids, candidate.ids) && !hasIdentityConflict(cluster, candidate));
+      if (secondaryMatch) {
+        mergeDiscoveryCandidate(secondaryMatch, candidate);
+        mergeCount += 1;
+      }
+      else unresolvedSecondary.push(candidate);
+      continue;
+    }
+    ambiguousCount += 1;
+  }
+
+  for (const header of accountHeaders) {
+    const headerAccount = header.accountNumber || header.ids?.accountNumber || null;
+    const represented = Boolean(headerAccount && [...clusters, ...unresolvedSecondary].some((candidate) =>
+      (candidate.accountNumber || candidate.ids?.accountNumber || null) === headerAccount));
+    if (!represented) ambiguousCount += 1;
+  }
+
+  if (identityConflictCount) {
+    return canonicalizationResult('PORTFOLIO_IDENTITY_CONFLICT', [...clusters, ...unresolvedSecondary]);
+  }
+  if (ambiguousCount) {
+    return canonicalizationResult('PORTFOLIO_IDENTITY_AMBIGUOUS', [...clusters, ...unresolvedSecondary]);
+  }
+
+  const candidates = [...clusters, ...unresolvedSecondary].sort((left, right) => left.index - right.index);
+  return canonicalizationResult(null, candidates);
+
+  function canonicalizationResult(errorCode, candidates = []) {
+    return {
+      errorCode,
+      candidates,
+      serviceCandidateCount: serviceCandidates.length,
+      metadataCandidateCount,
+      canonicalCandidateCount: candidates.length,
+      duplicatesCollapsedCount: mergeCount,
+      ambiguousCount,
+      identityConflictCount,
+    };
+  }
+}
+
+function hasAnyTechnicalIdentity(ids = {}) {
+  return DISCOVERY_IDENTITY_KEYS.some((key) => Boolean(ids[key]));
+}
+
+function hasPrimaryIdentity(ids = {}) {
+  return Boolean(ids.saId && ids.spId);
+}
+
+function hasSecondaryIdentity(ids = {}) {
+  return Boolean(ids.meterId && ids.badge);
+}
+
+function samePrimaryIdentity(left = {}, right = {}) {
+  return Boolean(left.saId && left.spId && left.saId === right.saId && left.spId === right.spId);
+}
+
+function sameSecondaryIdentity(left = {}, right = {}) {
+  return Boolean(left.meterId && left.badge && left.meterId === right.meterId && left.badge === right.badge);
+}
+
+function primaryClustersConflict(left, right) {
+  const leftIds = left.ids || {};
+  const rightIds = right.ids || {};
+  if (leftIds.spId && rightIds.spId && leftIds.spId === rightIds.spId && leftIds.saId !== rightIds.saId) return true;
+  if (leftIds.meterId && rightIds.meterId && leftIds.meterId === rightIds.meterId) return true;
+  if (leftIds.badge && rightIds.badge && leftIds.badge === rightIds.badge) return true;
+  return false;
+}
+
+function sharedIdentityCount(left = {}, right = {}) {
+  return DISCOVERY_IDENTITY_KEYS.filter((key) => left[key] && right[key] && left[key] === right[key]).length;
+}
+
+function identitiesCompatible(left, right) {
+  const sharedCount = sharedIdentityCount(left.ids, right.ids);
+  const sharesStrongIdentifier = ['spId', 'meterId', 'badge']
+    .some((key) => left.ids[key] && left.ids[key] === right.ids[key]);
+  return (sharesStrongIdentifier || sharedCount >= 2) && !hasIdentityConflict(left, right);
+}
+
+function hasIdentityConflict(left, right) {
+  if (left.accountNumber && right.accountNumber && left.accountNumber !== right.accountNumber) return true;
+  return DISCOVERY_IDENTITY_KEYS.some((key) => left.ids[key] && right.ids[key] && left.ids[key] !== right.ids[key]);
+}
+
+function cloneDiscoveryCandidate(candidate) {
+  return {
+    ...candidate,
+    ids: { ...(candidate.ids || {}) },
+    index: Number(candidate.index || 0),
+  };
+}
+
+function compareCandidateStrength(left, right) {
+  const score = (candidate) => DISCOVERY_IDENTITY_KEYS.filter((key) => Boolean(candidate.ids[key])).length;
+  return score(right) - score(left) || left.index - right.index;
+}
+
+function mergeDiscoveryCandidate(target, incoming) {
+  target.ids = mergeIdentifiers(target.ids, incoming.ids);
+  target.accountNumber = target.accountNumber || incoming.accountNumber || target.ids.accountNumber || null;
+  target.accountId = target.accountId || incoming.accountId || null;
+  target.label = preferDiscoveryLabel(target.label, incoming.label);
+  target.accountAlias = preferDiscoveryLabel(target.accountAlias, incoming.accountAlias);
+  target.supplyAlias = preferDiscoveryLabel(target.supplyAlias, incoming.supplyAlias);
+  target.location = target.location || incoming.location || null;
+  target.index = Math.min(target.index || incoming.index, incoming.index || target.index);
+  return target;
+}
+
+function mergeDiscoveryIdentifiersOrThrow(base, incoming) {
+  const left = { ids: base || {}, accountNumber: base?.accountNumber || null };
+  const right = { ids: incoming || {}, accountNumber: incoming?.accountNumber || null };
+  if (hasIdentityConflict(left, right)) {
+    const error = new Error('UTE devolvió identificadores contradictorios durante el enriquecimiento del suministro.');
+    error.code = 'PORTFOLIO_IDENTITY_CONFLICT';
+    error.operation = 'discovery';
+    throw error;
+  }
+  return mergeIdentifiers(base || {}, incoming || {});
+}
+
+function preferDiscoveryLabel(current, incoming) {
+  const generic = /^(?:opci[oó]n|suministro detectado)\s+\d+$/i;
+  if (!current) return incoming || null;
+  if (generic.test(String(current)) && incoming && !generic.test(String(incoming))) return incoming;
+  return current;
 }
 
 function hasValidTotalsPayload(data) {
@@ -556,4 +962,4 @@ function loadEnvIfPresent(envPath) {
   }
 }
 
-module.exports = { UtePortalClient, BASE, parseUserTypeOptions };
+module.exports = { UtePortalClient, BASE, parseUserTypeOptions, canonicalizeDiscoveryCandidates };

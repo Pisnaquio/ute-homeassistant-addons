@@ -32,12 +32,19 @@ function logEvent(level, event, fields = {}) {
     ts: new Date().toISOString(),
     level,
     event,
-    ...Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, redactValue(value)])),
+    ...Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, redactEntry(key, value)])),
   };
   const line = JSON.stringify(payload);
   if (level === 'error') console.error(line);
   else if (level === 'warn') console.warn(line);
   else console.log(line);
+}
+
+function redactEntry(key, value) {
+  if (/password|token|cookie|authorization|userId|accountNumber|saId|spId|meterId|badge|psId/i.test(key)) {
+    return '[REDACTED]';
+  }
+  return redactValue(value);
 }
 
 function redactValue(value) {

@@ -44,12 +44,14 @@ setEnvIfMissing('TZ', addonOptions.timezone);
 const runtimeName = firstNonEmpty(process.env.UTE_RUNTIME_NAME, 'ute');
 const runtimeRoot = isAddonRuntime
   ? path.join('/data', runtimeName)
-  : APP_ROOT;
+  : firstNonEmpty(process.env.UTE_RUNTIME_ROOT, path.join('/tmp', runtimeName));
 
 const runtimePaths = {
   appRoot: APP_ROOT,
   runtimeRoot,
-  dataDir: isAddonRuntime ? path.join(runtimeRoot, 'data') : path.join(APP_ROOT, 'data'),
+  dataDir: isAddonRuntime
+    ? path.join(runtimeRoot, 'data')
+    : firstNonEmpty(process.env.UTE_DATA_ROOT, path.join(APP_ROOT, 'data')),
   reportDir: isAddonRuntime ? path.join(runtimeRoot, 'reportes') : path.join(APP_ROOT, 'reportes'),
   logDir: isAddonRuntime ? path.join(runtimeRoot, 'logs') : path.join(APP_ROOT, 'logs'),
   tempDir: isAddonRuntime ? path.join(runtimeRoot, 'temp') : path.join(APP_ROOT, 'temp'),

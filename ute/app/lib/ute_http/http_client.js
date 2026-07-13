@@ -35,6 +35,7 @@ class HttpClient {
     let method = options.method || 'GET';
     let body = options.body;
     let redirectCount = 0;
+    const redirects = [];
     let headers = new Headers(options.headers || {});
 
     while (true) {
@@ -52,7 +53,7 @@ class HttpClient {
       if (this.followRedirects && isRedirectStatus(response.status)) {
         const location = response.headers.get('location');
         if (!location) {
-          return finalizeResponse(response);
+          return finalizeResponse(response, { redirects });
         }
 
         redirectCount += 1;
@@ -61,6 +62,11 @@ class HttpClient {
         }
 
         const nextUrl = new URL(location, currentUrl).href;
+        redirects.push({
+          status: response.status,
+          from: safeUrlForDiagnostic(currentUrl),
+          to: safeUrlForDiagnostic(nextUrl),
+        });
         const shouldSwitchToGet =
           response.status === 303 ||
           ((response.status === 301 || response.status === 302) && method !== 'GET' && method !== 'HEAD');
@@ -76,7 +82,7 @@ class HttpClient {
         continue;
       }
 
-      return finalizeResponse(response);
+      return finalizeResponse(response, { redirects });
     }
   }
 }
@@ -93,7 +99,7 @@ function prepareHeaders(baseHeaders, url, cookieJar, userAgent) {
   return headers;
 }
 
-async function finalizeResponse(response) {
+async function finalizeResponse(response, extra = {}) {
   const buffer = Buffer.from(await response.arrayBuffer());
   const text = buffer.toString('utf8');
   return {
@@ -101,9 +107,19 @@ async function finalizeResponse(response) {
     status: response.status,
     url: response.url,
     headers: response.headers,
+    redirects: extra.redirects || [],
     buffer,
     text,
   };
+}
+
+function safeUrlForDiagnostic(value) {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`;
+  } catch (_) {
+    return '';
+  }
 }
 
 function isRedirectStatus(status) {

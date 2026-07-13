@@ -7,6 +7,7 @@ const schedule = require('node-schedule');
 
 const DataProcessor = require('./lib/processor');
 const DataAnalyzer = require('./lib/analyzer');
+const ReportGenerator = require('./lib/reporter');
 const { loadPeriodDetail, savePeriodDetail } = require('./lib/period_detail_store');
 const { createUteDataSource } = require('./lib/ute_data_source');
 const { ensureRuntimeDirs, runtimePaths, isAddonRuntime } = require('./lib/runtime_env');
@@ -89,15 +90,23 @@ class UTEMonitor {
     this.storage = new RuntimeStorage(runtimePaths);
     this.storage.ensureSingleSupplyMigration();
     const portfolio = this.storage.getPortfolio();
-    const requestedSupplyKey = this.storage.resolveSupplyKey(process.env.UTE_SUPPLY_KEY)
+    const portfolioHealth = this.storage.getPortfolioHealth(portfolio);
+    let requestedSupplyKey = this.storage.resolveSupplyKey(process.env.UTE_SUPPLY_KEY)
       || this.storage.loadSelectedSupplyKey();
-    this.supplyKey = portfolio?.source === 'legacy-single-supply'
+    const portfolioSupplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
+    if (!requestedSupplyKey && portfolio?.source !== 'legacy-single-supply' &&
+        !portfolioHealth.unsafe && !portfolioHealth.contextIncomplete && portfolioSupplies.length === 1) {
+      requestedSupplyKey = this.storage.getOrCreateSelectedSupply(portfolio);
+    }
+    this.supplyKey = portfolio?.source === 'legacy-single-supply' || portfolioHealth.unsafe || portfolioHealth.contextIncomplete
       ? null
       : requestedSupplyKey;
     if (this.supplyKey && !this.storage.getActiveContext(this.supplyKey)) {
       this.supplyKey = null;
     }
-    if (!this.supplyKey && process.env.UTE_SYNC_ALL !== 'true' && portfolio && portfolio.accounts.flatMap((account) => account.supplies || []).length > 1) {
+    if (!this.supplyKey && process.env.UTE_SYNC_ALL !== 'true' && portfolio &&
+        !portfolioHealth.unsafe && !portfolioHealth.contextIncomplete &&
+        portfolio.accounts.flatMap((account) => account.supplies || []).length > 1) {
       const error = new Error('SUPPLY_SELECTION_REQUIRED: seleccioná un suministro antes de sincronizar');
       error.code = 'SUPPLY_SELECTION_REQUIRED';
       throw error;
@@ -108,6 +117,7 @@ class UTEMonitor {
 
     this.processor = new DataProcessor(this.dataDir);
     this.analyzer = new DataAnalyzer();
+    this.reporter = new ReportGenerator(this.reportDir);
 
     ensureRuntimeDirs();
   }
@@ -172,9 +182,10 @@ class UTEMonitor {
   }
 
   async ensureSupplyPortfolio(source) {
-    if (this.supplyKey) return this.activateSupply(this.supplyKey);
     const existing = this.storage.getPortfolio();
-    if (existing && existing.source !== 'legacy-single-supply') {
+    const health = this.storage.getPortfolioHealth(existing);
+    if (this.supplyKey && !health.unsafe && !health.contextIncomplete) return this.activateSupply(this.supplyKey);
+    if (existing && existing.source !== 'legacy-single-supply' && !health.unsafe && !health.contextIncomplete) {
       const supplies = existing.accounts.flatMap((account) => account.supplies || []);
       if (supplies.length === 1) {
         const selected = this.storage.getOrCreateSelectedSupply(existing);
@@ -187,7 +198,7 @@ class UTEMonitor {
       throw error;
     }
     const discovered = await source.discoverPortfolio();
-    const portfolio = this.storage.savePortfolio(discovered);
+    const portfolio = this.storage.saveDiscoveredPortfolio(discovered);
     const supplies = portfolio.accounts.flatMap((account) => account.supplies || []);
     const selected = this.storage.getOrCreateSelectedSupply(portfolio);
     if (supplies.length !== 1) {
@@ -285,8 +296,35 @@ class UTEMonitor {
 
   async syncAll() {
     this.validateCredentials();
-    const supplies = (this.storage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
+    let portfolio = this.storage.getPortfolio();
+    let health = this.storage.getPortfolioHealth(portfolio);
+    if (!portfolio || portfolio.source === 'legacy-single-supply' || health.unsafe || health.contextIncomplete) {
+      const source = this.createDataSource();
+      try {
+        portfolio = this.storage.saveDiscoveredPortfolio(await source.discoverPortfolio());
+        health = this.storage.getPortfolioHealth(portfolio);
+      } finally {
+        await source.close().catch(() => {});
+      }
+    }
+    if (health.unsafe) {
+      const error = new Error('PORTFOLIO_IDENTITY_CONFLICT: el portfolio no es seguro para sync-all');
+      error.code = 'PORTFOLIO_IDENTITY_CONFLICT';
+      throw error;
+    }
+    const supplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
+    if (new Set(supplies.map((supply) => supply.supplyKey)).size !== supplies.length) {
+      const error = new Error('PORTFOLIO_KEY_COLLISION: sync-all cancelado');
+      error.code = 'PORTFOLIO_KEY_COLLISION';
+      throw error;
+    }
     if (!supplies.length) throw new Error('No hay portfolio descubierto para sincronizar');
+    const incomplete = supplies.filter((supply) => !this.storage.isSupplySyncReady(supply.supplyKey));
+    if (incomplete.length) {
+      const error = new Error('MULTI_ACCOUNT_CONTEXT_INCOMPLETE: uno o más suministros no tienen contexto técnico completo');
+      error.code = 'MULTI_ACCOUNT_CONTEXT_INCOMPLETE';
+      throw error;
+    }
     const { spawnSync } = require('child_process');
     const failures = [];
     for (const supply of supplies) {
@@ -361,6 +399,15 @@ class UTEMonitor {
         console.log(chalk.bold.cyan('\n📅 CARGANDO DETALLE DIARIO DEL PERÍODO\n'));
       }
 
+      const portfolio = this.storage.getPortfolio();
+      const health = this.storage.getPortfolioHealth(portfolio);
+      if (portfolio?.source !== 'legacy-single-supply' &&
+          (health.unsafe || health.contextIncomplete || !this.supplyKey)) {
+        this.validateCredentials();
+        source = this.createDataSource();
+        await this.ensureSupplyPortfolio(source);
+      }
+
       if (!forceLive) {
         const cached = loadPeriodDetail(this.dataDir, periodoInicio, periodoFin);
         if (cached) {
@@ -379,7 +426,8 @@ class UTEMonitor {
 
       this.validateCredentials();
       const historicalRecord = this.getHistoricalRecordFromPeriod(periodoFin);
-      source = this.createDataSource();
+      if (!source) source = this.createDataSource();
+      await this.ensureSupplyPortfolio(source);
       const detailResult = await source.fetchPeriodDetail(periodoInicio, periodoFin, {
         quiet: jsonOnly,
         fallbackTotals: historicalRecord
@@ -428,6 +476,7 @@ class UTEMonitor {
 
       this.validateCredentials();
       source = this.createDataSource();
+      await this.ensureSupplyPortfolio(source);
       const fetchedAt = new Date().toISOString();
       const results = { saved: 0, skipped: 0, failed: [] };
 
@@ -484,6 +533,7 @@ class UTEMonitor {
   async analyze(data = null) {
     try {
       console.log(chalk.bold.cyan('\n📈 ANALIZANDO DATOS DE CONSUMO\n'));
+      this.assertReadableLocalContext();
 
       // Cargar datos si no se proporcionan
       if (!data) {
@@ -515,6 +565,53 @@ class UTEMonitor {
     }
   }
 
+  async report() {
+    try {
+      console.log(chalk.bold.cyan('\n📄 GENERANDO REPORTE\n'));
+      console.log(chalk.yellow('⚠️ `report` es una salida legacy. El dashboard vivo en http://localhost:3010 sigue siendo la vista principal.\n'));
+
+      // Cargar datos
+      const data = this.processor.loadExistingData();
+
+      if (data.length === 0) {
+        console.log(chalk.yellow('⚠️ No hay datos para generar reporte. Ejecuta: node ute_monitor.js download'));
+        return;
+      }
+
+      // Analizar
+      this.analyzer.setData(data);
+      const analysis = this.analyzer.getAnalysisSummary();
+
+      // Generar reporte para el mes actual
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth() + 1;
+
+      console.log(`📅 Generando reporte para ${month}/${year}...\n`);
+
+      const reportFile = this.reporter.generateHTMLReport(data, analysis, year, month);
+
+      console.log(chalk.green(`✅ Reporte generado: ${reportFile}`));
+      this.log(`Reporte generado: ${reportFile}`);
+
+      // También generar reportes para últimos 12 meses
+      const last12 = data.slice(-12);
+      if (last12.length > 0) {
+        console.log('\n📊 Generando resumen de últimos 12 meses...');
+        const summary = { ...analysis, monthlySummary: this.analyzer.generateMonthlySummary() };
+        const summaryFile = this.reporter.generateHTMLReport(last12, summary, year, month);
+        console.log(chalk.green(`✅ Resumen guardado: ${summaryFile}`));
+      }
+
+      return reportFile;
+
+    } catch (error) {
+      this.log(`Error generando reporte: ${error.message}`, 'error');
+      console.error(chalk.red(`❌ Error: ${error.message}`));
+      throw error;
+    }
+  }
+
   async schedule() {
     try {
       console.log(chalk.bold.cyan('\n⏰ CONFIGURANDO DESCARGA AUTOMÁTICA\n'));
@@ -536,6 +633,7 @@ class UTEMonitor {
         try {
           const data = await this.download();
           await this.analyze(data);
+          await this.report();
           console.log(chalk.green('✅ Descarga automática completada exitosamente'));
           this.log('Descarga automática completada exitosamente', 'success');
         } catch (error) {
@@ -562,6 +660,7 @@ class UTEMonitor {
   status() {
     try {
       console.log(chalk.bold.cyan('\n📊 ESTADO DEL MONITOR\n'));
+      this.assertReadableLocalContext();
 
       const data = this.processor.loadExistingData();
 
@@ -605,6 +704,18 @@ class UTEMonitor {
     }
   }
 
+  assertReadableLocalContext() {
+    const portfolio = this.storage.getPortfolio();
+    if (!portfolio || portfolio.source === 'legacy-single-supply') return true;
+    const health = this.storage.getPortfolioHealth(portfolio);
+    if (health.unsafe || health.contextIncomplete || !this.supplyKey || !this.storage.isSupplySyncReady(this.supplyKey)) {
+      const error = new Error('SUPPLY_CONTEXT_UNAVAILABLE: redescubrí y seleccioná un suministro válido antes de leer datos locales.');
+      error.code = 'SUPPLY_CONTEXT_UNAVAILABLE';
+      throw error;
+    }
+    return true;
+  }
+
   showHelp() {
     console.log(chalk.bold.cyan(`\n📚 UTE MONITOR v${VERSION}\n`));
     console.log(chalk.white('Monitoreo automatizado de consumo de energía UTE\n'));
@@ -619,6 +730,10 @@ class UTEMonitor {
       {
         cmd: 'analyze',
         desc: 'Analizar datos y mostrar estadísticas'
+      },
+      {
+        cmd: 'report',
+        desc: 'Generar reporte HTML legacy con gráficos'
       },
       {
         cmd: 'schedule',
@@ -649,6 +764,7 @@ class UTEMonitor {
     console.log(chalk.bold('\nEJEMPLOS:\n'));
     console.log(chalk.white('  node ute_monitor.js download    # Descargar ahora'));
     console.log(chalk.white('  node ute_monitor.js analyze     # Analizar datos'));
+    console.log(chalk.white('  node ute_monitor.js report      # Generar reporte'));
     console.log(chalk.white('  node ute_monitor.js period-detail 27-04-2026 26-05-2026   # Curva diaria de un período'));
     console.log(chalk.white('  node ute_monitor.js backfill-period-details 2023-05 2026-05   # Cachear varios meses'));
     console.log(chalk.white('  node ute_monitor.js schedule    # Descargar automáticamente\n'));
@@ -678,6 +794,10 @@ class UTEMonitor {
 
       case 'analyze':
         await this.analyze();
+        break;
+
+      case 'report':
+        await this.report();
         break;
 
       case 'schedule':

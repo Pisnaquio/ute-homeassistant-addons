@@ -60,7 +60,7 @@ let loggedIn = false;
 let lastUsed = 0;
 const SESSION_TTL = 20 * 60 * 1000; // 20 minutes
 
-async function ensureSession() {
+async function ensureSession(requestedSupplyContext = null) {
   const now = Date.now();
 
   // Check if we need to close a stale session
@@ -99,11 +99,14 @@ async function ensureSession() {
       throw new Error('UTE login failed — check credentials');
     }
     loggedIn = true;
-    portalContext = await discoverPortalContext(page, {
+    portalContext = exactTechnicalContext(requestedSupplyContext) || await discoverPortalContext(page, {
       logger: (...args) => sessionLog(...args)
     });
     sessionLog('[UTE Session] Logged in ✅');
   }
+
+  const exactContext = exactTechnicalContext(requestedSupplyContext);
+  if (exactContext) portalContext = exactContext;
 
   lastUsed = now;
   return page;
@@ -215,7 +218,7 @@ async function fetchPeriodSnapshot(pageRef, periodoInicio, periodoFin, options =
  */
 async function fetchCurrentPeriod(options = {}) {
   return withSessionOptions(options, async () => {
-    const p = await ensureSession();
+    const p = await ensureSession(options.supplyContext);
     if (!portalContext?.saId || !portalContext?.spId) {
       throw new Error('UTE session is missing saId/spId');
     }
@@ -274,7 +277,7 @@ async function fetchCurrentPeriod(options = {}) {
 
 async function fetchPeriodDetail(periodoInicio, periodoFin, options = {}) {
   return withSessionOptions(options, async () => {
-    const p = await ensureSession();
+    const p = await ensureSession(options.supplyContext);
     return fetchPeriodSnapshot(p, periodoInicio, periodoFin, {
       includePreviousComparison: true,
       fallbackTotals: options.fallbackTotals
@@ -316,7 +319,7 @@ async function fetchJson(p, url, options = {}) {
       const parsed = tryParseJson(text);
       if (parsed) return parsed;
       lastErr = new Error(`UTE devolvió contenido no JSON para ${options.label || 'endpoint'}`);
-      console.error('[UTE Session] JSON parse error:', text.substring(0, 200));
+      console.error(`[UTE Session] JSON parse error: ${options.label || 'endpoint'} devolvió contenido no JSON`);
     } catch (err) {
       lastErr = err;
     }
@@ -327,7 +330,7 @@ async function fetchJson(p, url, options = {}) {
         const parsed = tryParseJson(text);
         if (parsed) return parsed;
         lastErr = new Error(`UTE devolvió contenido no JSON para ${options.label || 'endpoint'} (fallback)`);
-        console.error('[UTE Session] JSON parse error:', text.substring(0, 200));
+        console.error(`[UTE Session] JSON parse error: ${options.label || 'endpoint'} devolvió contenido no JSON (fallback)`);
       } catch (err) {
         lastErr = err;
       }
@@ -338,6 +341,17 @@ async function fetchJson(p, url, options = {}) {
 
   if (options.nullOnFailure) return null;
   throw lastErr || new Error(`UTE no devolvió JSON válido para ${options.label || 'endpoint'}`);
+}
+
+function exactTechnicalContext(value) {
+  const technical = value?.technical || value || {};
+  if (!['saId', 'spId', 'meterId', 'badge'].every((key) => Boolean(technical[key]))) return null;
+  return Object.freeze({
+    saId: technical.saId,
+    spId: technical.spId,
+    meterId: technical.meterId,
+    badge: technical.badge,
+  });
 }
 
 function parsePeriodPayload(periodoInicio, periodoFin, dailyData, totalsData) {

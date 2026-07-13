@@ -12,7 +12,6 @@ const { SyncManager } = require('./lib/sync_manager');
 const { logEvent, redact } = require('./lib/safe_log');
 const { RuntimeStorage } = require('./lib/runtime_storage');
 const { createUteDataSource } = require('./lib/ute_data_source');
-const CHART_BUNDLE = path.join(path.dirname(require.resolve('chart.js')), 'chart.umd.js');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -21,10 +20,13 @@ app.use(express.json());
 ensureRuntimeDirs();
 const runtimeStorage = new RuntimeStorage(runtimePaths);
 runtimeStorage.ensureSingleSupplyMigration();
+app.use('/assets', express.static(path.join(__dirname, 'assets')));
+app.use('/sample-data', express.static(path.join(__dirname, 'sample-data')));
 
 // ── Data helpers ─────────────────────────────────────────────────────────────
 const SYNC_STATE_PATH = path.join(runtimePaths.tempDir, 'sync-status.json');
 const PERIOD_DETAIL_CACHE = new Map();
+const DEMO_DATA_DIR = path.join(__dirname, 'sample-data');
 const EXPORT_ALLOWLIST = Object.freeze({
   'consumo_ute_2024.xlsx': 'consumo_ute_2024.xlsx',
   'consumo_ute_2025.xlsx': 'consumo_ute_2025.xlsx',
@@ -33,12 +35,15 @@ const EXPORT_ALLOWLIST = Object.freeze({
 const SAFE_EXPORT_FILE_RE = /^[A-Za-z0-9._-]+$/;
 
 function activeDataDir() {
+  const portfolio = runtimeStorage.getPortfolio();
+  if (!portfolio || portfolio.source === 'legacy-single-supply') return runtimePaths.dataDir;
   const supplyKey = runtimeStorage.loadSelectedSupplyKey();
-  return supplyKey ? runtimeStorage.getSupplyDataPath(supplyKey) : runtimePaths.dataDir;
+  const active = supplyKey ? runtimeStorage.getActiveContext(supplyKey) : null;
+  return active ? runtimeStorage.getSupplyDataPath(active.supplyKey) : null;
 }
-function consumoPath() { return path.join(activeDataDir(), 'consumo.json'); }
-function periodoPath() { return path.join(activeDataDir(), 'periodo_actual.json'); }
-function periodDetailsDir() { return path.join(activeDataDir(), 'periodos_detalle'); }
+function consumoPath() { const root = activeDataDir(); return root ? path.join(root, 'consumo.json') : null; }
+function periodoPath() { const root = activeDataDir(); return root ? path.join(root, 'periodo_actual.json') : null; }
+function periodDetailsDir() { const root = activeDataDir(); return root ? path.join(root, 'periodos_detalle') : null; }
 
 function normalizeExportFileName(rawName) {
   if (typeof rawName !== 'string' || !rawName.length) return null;
@@ -72,11 +77,13 @@ function resolveSafeExportPath(rawName) {
   const fileName = normalizeExportFileName(rawName);
   if (!fileName) return null;
 
-  const candidate = path.join(activeDataDir(), fileName);
+  const dataRootPath = activeDataDir();
+  if (!dataRootPath) return null;
+  const candidate = path.join(dataRootPath, fileName);
   if (!fs.existsSync(candidate)) return null;
 
   try {
-    const dataRoot = fs.realpathSync(activeDataDir());
+    const dataRoot = fs.realpathSync(dataRootPath);
     const realFile = fs.realpathSync(candidate);
     const relative = path.relative(dataRoot, realFile);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
@@ -90,6 +97,78 @@ function hasConfiguredCredentials() {
   return Boolean(process.env.UTE_EMAIL && process.env.UTE_PASSWORD);
 }
 
+function hasDemoQuery(req) {
+  return req?.query?.demo === '1' || req?.query?.demo === 'true';
+}
+
+function parseDemoData(filePath) {
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); }
+  catch(error) { return null; }
+}
+
+function loadDemoHistorical() {
+  return parseDemoData(path.join(DEMO_DATA_DIR, 'consumo.json')) || [];
+}
+
+function loadDemoCurrent() {
+  return parseDemoData(path.join(DEMO_DATA_DIR, 'periodo_actual.json')) || null;
+}
+
+function loadDemoPeriodDetailIndex() {
+  try {
+    const detailsDir = path.join(DEMO_DATA_DIR, 'periodos_detalle');
+    if (!fs.existsSync(detailsDir)) return [];
+    return fs.readdirSync(detailsDir)
+      .filter(name => /^\d{4}-\d{2}\.json$/.test(name))
+      .sort()
+      .map((name) => {
+        const fullPath = path.join(detailsDir, name);
+        const parsed = fs.readJsonSync(fullPath);
+        const endDate = parsePortalDateServer(parsed.periodo_fin);
+        return {
+          key: `hist:${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, '0')}`,
+          mes: endDate.getMonth() + 1,
+          año: endDate.getFullYear(),
+          periodo_inicio: parsed.periodo_inicio,
+          periodo_fin: parsed.periodo_fin,
+          _daily_only: true,
+          _source: 'local-cache',
+        };
+      });
+  } catch (error) {
+    return [];
+  }
+}
+
+function loadDemoPeriodDetail(start, end) {
+  const startDate = parsePortalDateServer(start);
+  if (!startDate || Number.isNaN(startDate.getTime())) return null;
+  const candidates = [];
+  candidates.push(`${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}`);
+  const fallbackStart = new Date(startDate.getFullYear(), startDate.getMonth() + 1, startDate.getDate());
+  candidates.push(`${fallbackStart.getFullYear()}-${String(fallbackStart.getMonth() + 1).padStart(2, '0')}`);
+
+  for (const fileKey of candidates) {
+    const dataPath = path.join(DEMO_DATA_DIR, 'periodos_detalle', `${fileKey}.json`);
+    const raw = parseDemoData(dataPath);
+    if (!raw) continue;
+    if (raw.periodo_inicio === start && raw.periodo_fin === end) return { ...raw, _source: 'local-cache' };
+  }
+
+  const detailsDir = path.join(DEMO_DATA_DIR, 'periodos_detalle');
+  try {
+    const files = fs.readdirSync(detailsDir).filter((name) => /^\d{4}-\d{2}\.json$/.test(name));
+    for (const name of files) {
+      const raw = parseDemoData(path.join(detailsDir, name));
+      if (raw && raw.periodo_inicio === start && raw.periodo_fin === end) return { ...raw, _source: 'local-cache' };
+    }
+  } catch (error) {
+    return null;
+  }
+
+  return null;
+}
+
 function missingCredentialsPayload() {
   return {
     error: 'missing_credentials',
@@ -99,34 +178,61 @@ function missingCredentialsPayload() {
   };
 }
 
-function requireConfiguredCredentials(res) {
-  if (hasConfiguredCredentials()) return true;
+function requireConfiguredCredentials(req, res) {
+  if (hasDemoQuery(req) || hasConfiguredCredentials()) return true;
   res.status(428).json(missingCredentialsPayload());
   return false;
 }
 
 function requireSelectedSupplyForMutation(res) {
-  const supplies = (runtimeStorage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
-  const selected = runtimeStorage.loadSelectedSupplyKey();
-  if (supplies.length > 1 && (!selected || !runtimeStorage.supplyExists(selected))) {
+  const portfolio = runtimeStorage.getPortfolio();
+  const supplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
+  const health = runtimeStorage.getPortfolioHealth(portfolio);
+  if (portfolio && portfolioHealthBlocksOperations(portfolio, health)) {
+    res.status(409).json({ error: 'PORTFOLIO_REFRESH_REQUIRED', message: 'UTE debe redescubrir el suministro antes de sincronizar.' });
+    return false;
+  }
+  const selected = runtimeStorage.loadSelectedSupplyKey() || runtimeStorage.getOrCreateSelectedSupply(portfolio);
+  if (portfolio?.source !== 'legacy-single-supply' && supplies.length && (!selected || !runtimeStorage.supplyExists(selected))) {
     res.status(409).json({ error: 'SUPPLY_SELECTION_REQUIRED', message: 'Seleccioná un suministro antes de sincronizar.' });
     return false;
   }
-  if (supplies.length > 1 && !runtimeStorage.isSupplySyncReady(selected)) {
+  if (portfolio?.source !== 'legacy-single-supply' && selected && !runtimeStorage.isSupplySyncReady(selected)) {
     res.status(409).json({ error: 'MULTI_ACCOUNT_CONTEXT_INCOMPLETE', message: 'El suministro seleccionado todavía no tiene el contexto técnico completo para sincronizar.' });
     return false;
   }
   return true;
 }
 
+function portfolioHealthBlocksOperations(portfolio, health = runtimeStorage.getPortfolioHealth(portfolio)) {
+  return Boolean(health.unsafe || (portfolio?.source !== 'legacy-single-supply' && health.contextIncomplete));
+}
+
+function requireReadableSupplyContext(res) {
+  const portfolio = runtimeStorage.getPortfolio();
+  if (!portfolio || portfolio.source === 'legacy-single-supply') return true;
+  const health = runtimeStorage.getPortfolioHealth(portfolio);
+  const selected = runtimeStorage.loadSelectedSupplyKey();
+  const active = selected ? runtimeStorage.getActiveContext(selected) : null;
+  if (health.unsafe || health.contextIncomplete || !active || !runtimeStorage.isSupplySyncReady(active.supplyKey)) {
+    res.status(409).json({ error: 'SUPPLY_CONTEXT_UNAVAILABLE', message: 'No hay un suministro válido seleccionado para leer los datos.' });
+    return false;
+  }
+  return true;
+}
+
 function loadHistorical() {
-  try { return JSON.parse(fs.readFileSync(consumoPath(), 'utf8')); }
+  const filePath = consumoPath();
+  if (!filePath) return [];
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); }
   catch(e) { return []; }
 }
 
 function loadPeriodoActual() {
+  const filePath = periodoPath();
+  if (!filePath) return null;
   try {
-    return JSON.parse(fs.readFileSync(periodoPath(), 'utf8'));
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch(e) {
     return null;
   }
@@ -135,7 +241,7 @@ function loadPeriodoActual() {
 function loadPeriodDetailIndex() {
   try {
     const detailsDir = periodDetailsDir();
-    if (!fs.existsSync(detailsDir)) return [];
+    if (!detailsDir || !fs.existsSync(detailsDir)) return [];
     const files = fs.readdirSync(detailsDir)
       .filter(name => /^\d{4}-\d{2}\.json$/.test(name))
       .sort();
@@ -168,17 +274,40 @@ const syncManager = new SyncManager({ cwd: __dirname, statePath: SYNC_STATE_PATH
 const AUTO_CURRENT_REFRESH_MAX_AGE_MS = 8 * 60 * 60 * 1000;
 const AUTO_CURRENT_REFRESH_CHECK_MS = 3 * 60 * 60 * 1000;
 let nextAutoRefreshAt = 0;
+let portfolioRefreshRunning = false;
 
 function startSync(kind, args) {
-  const supplyKey = runtimeStorage.loadSelectedSupplyKey();
+  if (portfolioRefreshRunning) return null;
+  const storedKey = runtimeStorage.loadSelectedSupplyKey();
+  const supplyKey = storedKey && runtimeStorage.getActiveContext(storedKey) ? storedKey : null;
   const env = { ...process.env };
   if (supplyKey) env.UTE_SUPPLY_KEY = supplyKey;
   return syncManager.start(kind, args, env);
 }
 
+function clearLocalRuntimeData() {
+  const dataRoot = activeDataDir();
+  if (!dataRoot) return [];
+  const targets = [
+    consumoPath(),
+    periodoPath(),
+    periodDetailsDir(),
+    ...Object.values(EXPORT_ALLOWLIST).map(file => path.join(dataRoot, file)),
+  ];
+  const removed = [];
+  for (const target of targets) {
+    if (!fs.existsSync(target)) continue;
+    fs.removeSync(target);
+    removed.push(path.basename(target));
+  }
+  PERIOD_DETAIL_CACHE.clear();
+  return removed;
+}
+
 function toClientPortfolio(portfolio) {
   return {
     schemaVersion: portfolio.schemaVersion,
+    discoveryRevision: portfolio.discoveryRevision,
     generatedAt: portfolio.generatedAt,
     source: portfolio.source,
     accounts: (portfolio.accounts || []).map((account) => ({
@@ -203,27 +332,56 @@ function toClientPortfolio(portfolio) {
 
 // ── API routes ────────────────────────────────────────────────────────────────
 app.get('/api/data', (req, res) => {
-  if (!requireConfiguredCredentials(res)) return;
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (hasDemoQuery(req)) {
+    res.json(loadDemoHistorical());
+    return;
+  }
+  if (!requireReadableSupplyContext(res)) return;
   res.json(loadHistorical());
 });
 
 app.get('/api/config-status', (req, res) => {
-  const credentialsConfigured = hasConfiguredCredentials();
+  const demo = hasDemoQuery(req);
+  const credentialsConfigured = demo || hasConfiguredCredentials();
   res.json({
     credentials_configured: credentialsConfigured,
-    login_required: !credentialsConfigured
+    login_required: !credentialsConfigured,
+    demo,
   });
 });
 
-app.get('/api/portfolio', (_req, res) => {
+app.get('/api/portfolio', (req, res) => {
+  if (hasDemoQuery(req)) return res.json({ schemaVersion: '2.0.0', source: 'demo', accounts: [], selectedSupplyKey: 'k_0000000000000000' });
   const portfolio = runtimeStorage.getPortfolio();
   if (!portfolio) return res.status(404).json({ error: 'portfolio_not_discovered', login_required: !hasConfiguredCredentials() });
   return res.json({ ...toClientPortfolio(portfolio), selectedSupplyKey: runtimeStorage.loadSelectedSupplyKey() });
 });
 
-app.get('/api/supplies', (_req, res) => {
+app.get('/api/supplies', (req, res) => {
+  if (hasDemoQuery(req)) {
+    return res.json({
+      supplies: [{
+        supplyKey: 'k_0000000000000000',
+        accountKey: 'k_0000000000000000',
+        accountAlias: 'Cuenta demo',
+        alias: 'Suministro sintético',
+        location: 'Datos de demostración',
+        syncReady: true,
+        capabilities: { hasAMI: true, supportsDailyDetail: true, canEstimateTRT: true },
+        meters: [],
+      }],
+      selectedSupplyKey: 'k_0000000000000000',
+      selectionRequired: false,
+      source: 'demo',
+      needsRefresh: false,
+      unsafe: false,
+      contextIncomplete: false,
+    });
+  }
   const portfolio = runtimeStorage.getPortfolio();
-  if (!portfolio) return res.json({ supplies: [], selectedSupplyKey: null, selectionRequired: false, source: null });
+  if (!portfolio) return res.json({ supplies: [], selectedSupplyKey: null, selectionRequired: false, source: null, needsRefresh: false });
+  const health = runtimeStorage.getPortfolioHealth(portfolio);
   const supplies = portfolio.accounts.flatMap((account) => (account.supplies || []).map((supply) => ({
     supplyKey: supply.supplyKey,
     accountKey: account.accountKey,
@@ -239,70 +397,105 @@ app.get('/api/supplies', (_req, res) => {
       status: meter.status,
     })),
   })));
-  const selectedSupplyKey = runtimeStorage.loadSelectedSupplyKey();
+  const selectedCandidate = runtimeStorage.loadSelectedSupplyKey();
+  const selectedSupplyKey = selectedCandidate && runtimeStorage.supplyExists(selectedCandidate)
+    ? selectedCandidate
+    : runtimeStorage.getOrCreateSelectedSupply(portfolio);
   return res.json({
     supplies,
     selectedSupplyKey,
     selectionRequired: supplies.length > 1 && (!selectedSupplyKey || !runtimeStorage.supplyExists(selectedSupplyKey) || !runtimeStorage.isSupplySyncReady(selectedSupplyKey)),
     source: portfolio.source,
+    discoveryRevision: portfolio.discoveryRevision,
+    needsRefresh: health.needsRefresh,
+    unsafe: health.unsafe,
+    contextIncomplete: portfolio.source === 'legacy-single-supply' ? false : health.contextIncomplete,
   });
 });
 
 app.post('/api/supply/select', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
+  if (portfolioRefreshRunning) return res.status(409).json({ error: 'PORTFOLIO_REFRESH_BUSY' });
+  const portfolio = runtimeStorage.getPortfolio();
+  const health = runtimeStorage.getPortfolioHealth(portfolio);
+  if (portfolioHealthBlocksOperations(portfolio, health)) {
+    return res.status(409).json({ error: 'PORTFOLIO_REFRESH_REQUIRED', message: 'Redescubrí los suministros antes de seleccionar.' });
+  }
   const supplyKey = runtimeStorage.resolveSupplyKey(req.body?.supplyKey);
   if (!supplyKey || !runtimeStorage.supplyExists(supplyKey)) return res.status(400).json({ error: 'invalid_supply_key' });
   if (!runtimeStorage.isSupplySyncReady(supplyKey)) {
     return res.status(409).json({ error: 'MULTI_ACCOUNT_CONTEXT_INCOMPLETE', message: 'Ese suministro todavía no tiene el contexto técnico completo para sincronizar.' });
   }
-  runtimeStorage.setSelectedSupplyKey(supplyKey);
-  PERIOD_DETAIL_CACHE.clear();
-  return res.json({ ok: true, selectedSupplyKey: supplyKey });
+  try {
+    runtimeStorage.setSelectedSupplyKey(supplyKey);
+    PERIOD_DETAIL_CACHE.clear();
+    return res.json({ ok: true, selectedSupplyKey: supplyKey });
+  } catch (error) {
+    if (error.code === 'PORTFOLIO_REFRESH_BUSY') return res.status(409).json({ error: error.code });
+    throw error;
+  }
 });
 
-app.post('/api/portfolio/refresh', async (_req, res) => {
-  if (!requireConfiguredCredentials(res)) return;
+app.post('/api/portfolio/refresh', async (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (syncManager.isRunning() || portfolioRefreshRunning) {
+    return res.status(409).json({ error: 'PORTFOLIO_REFRESH_BUSY', message: 'Esperá a que termine la operación en curso.' });
+  }
+  portfolioRefreshRunning = true;
   const source = createUteDataSource({ userId: process.env.UTE_EMAIL, password: process.env.UTE_PASSWORD, mode: process.env.UTE_SOURCE || 'auto' });
   try {
     const portfolio = await source.discoverPortfolio();
-    const stored = runtimeStorage.savePortfolio(portfolio);
-    runtimeStorage.getOrCreateSelectedSupply(stored);
+    const stored = runtimeStorage.saveDiscoveredPortfolio(portfolio);
     PERIOD_DETAIL_CACHE.clear();
     return res.json({ ok: true, portfolio: toClientPortfolio(stored), selectedSupplyKey: runtimeStorage.loadSelectedSupplyKey() });
   } catch (error) {
-    return res.status(error.code === 'SUPPLY_SELECTION_REQUIRED' ? 409 : 502).json({
+    const conflict = ['SUPPLY_SELECTION_REQUIRED', 'PORTFOLIO_REFRESH_BUSY'].includes(error.code);
+    return res.status(conflict ? 409 : 502).json({
       error: error.code || 'portfolio_discovery_failed',
       message: redact(error.message),
     });
   } finally {
     await source.close().catch(() => {});
+    portfolioRefreshRunning = false;
   }
 });
 
 app.delete('/api/supply/:supplyKey', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
+  if (portfolioRefreshRunning) return res.status(409).json({ error: 'PORTFOLIO_REFRESH_BUSY' });
   const supplyKey = runtimeStorage.resolveSupplyKey(req.params.supplyKey);
   if (!supplyKey || !runtimeStorage.supplyExists(supplyKey)) return res.status(404).json({ error: 'supply_not_found' });
-  if (!runtimeStorage.removeSupply(supplyKey)) return res.status(404).json({ error: 'supply_not_found' });
-  return res.json({ ok: true, selectedSupplyKey: runtimeStorage.loadSelectedSupplyKey() });
+  try {
+    if (!runtimeStorage.removeSupply(supplyKey)) return res.status(404).json({ error: 'supply_not_found' });
+    return res.json({ ok: true, selectedSupplyKey: runtimeStorage.loadSelectedSupplyKey() });
+  } catch (error) {
+    if (error.code === 'PORTFOLIO_REFRESH_BUSY') return res.status(409).json({ error: error.code });
+    throw error;
+  }
 });
 
-app.get('/api/diagnostic/download', (_req, res) => {
+app.get('/api/diagnostic/download', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
   const diagnostic = runtimeStorage.exportDiagnostic(runtimeStorage.loadSelectedSupplyKey());
   res.setHeader('content-type', 'application/json; charset=utf-8');
   res.setHeader('content-disposition', 'attachment; filename="ute-diagnostic.json"');
   return res.send(JSON.stringify(diagnostic, null, 2));
 });
 
-app.get('/api/sync-status', (_req, res) => {
+app.get('/api/sync-status', (req, res) => {
+  if (hasDemoQuery(req)) return res.json({ status: 'idle', id: null, kind: null, stage: null, supplyKey: null, error: null });
   res.json(syncManager.getStatus());
 });
 
 // Serves data/periodo_actual.json — written by `node ute_monitor.js current` (or download)
 app.get('/api/current', (req, res) => {
-  if (!hasConfiguredCredentials()) {
+  if (!hasDemoQuery(req) && !hasConfiguredCredentials()) {
     return res.status(428).json(missingCredentialsPayload());
   }
+  if (!hasDemoQuery(req) && !requireReadableSupplyContext(res)) return;
 
-  const data = loadPeriodoActual();
+  const data = hasDemoQuery(req) ? loadDemoCurrent() : loadPeriodoActual();
   if (!data) {
     return res.status(503).json({
       error: 'Sin datos de período actual. Ejecutá: node ute_monitor.js current'
@@ -314,12 +507,33 @@ app.get('/api/current', (req, res) => {
 });
 
 app.get('/api/period-detail-index', (req, res) => {
-  if (!requireConfiguredCredentials(res)) return;
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (hasDemoQuery(req)) {
+    res.json(loadDemoPeriodDetailIndex());
+    return;
+  }
+  if (!requireReadableSupplyContext(res)) return;
   res.json(loadPeriodDetailIndex());
 });
 
 app.get('/api/period-detail', (req, res) => {
-  if (!requireConfiguredCredentials(res)) return;
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (hasDemoQuery(req)) {
+    const { start, end } = req.query || {};
+    const detail = loadDemoPeriodDetail(start, end);
+    if (!detail) {
+      return res.status(404).json({
+        error: 'Ese período todavía no está guardado localmente (seed demo).',
+        detail: 'Probá otro mes o actualizá los datos disponibles.'
+      });
+    }
+    return res.json({
+      ...detail,
+      _source: 'local-cache',
+      _demo: true,
+    });
+  }
+  if (!requireReadableSupplyContext(res)) return;
 
   const { start, end } = req.query || {};
   const validDate = /^\d{2}-\d{2}-\d{4}$/;
@@ -332,7 +546,9 @@ app.get('/api/period-detail', (req, res) => {
     return res.json(PERIOD_DETAIL_CACHE.get(cacheKey));
   }
 
-  const local = loadPeriodDetail(activeDataDir(), start, end);
+  const dataRoot = activeDataDir();
+  if (!dataRoot) return res.status(409).json({ error: 'SUPPLY_CONTEXT_UNAVAILABLE' });
+  const local = loadPeriodDetail(dataRoot, start, end);
   if (local) {
     PERIOD_DETAIL_CACHE.set(cacheKey, local);
     return res.json(local);
@@ -345,7 +561,7 @@ app.get('/api/period-detail', (req, res) => {
       ...closedPrev,
       _source: 'current-snapshot'
     };
-    savePeriodDetail(activeDataDir(), closedPrev, { storedAt: current?.fetched_at || new Date().toISOString() });
+    savePeriodDetail(dataRoot, closedPrev, { storedAt: current?.fetched_at || new Date().toISOString() });
     PERIOD_DETAIL_CACHE.set(cacheKey, stored);
     return res.json(stored);
   }
@@ -358,6 +574,7 @@ app.get('/api/period-detail', (req, res) => {
 
 // Trigger full historical download (also updates periodo_actual.json)
 app.post('/api/refresh', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
   if (!hasConfiguredCredentials()) {
     return res.status(428).json(missingCredentialsPayload());
   }
@@ -370,6 +587,7 @@ app.post('/api/refresh', (req, res) => {
 
 // Trigger lightweight current-period-only refresh (~1 min vs ~5 min for full download)
 app.post('/api/refresh-current', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
   if (!hasConfiguredCredentials()) {
     return res.status(428).json(missingCredentialsPayload());
   }
@@ -381,21 +599,47 @@ app.post('/api/refresh-current', (req, res) => {
 });
 
 app.post('/api/refresh-all', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
   if (!hasConfiguredCredentials()) return res.status(428).json(missingCredentialsPayload());
+  if (portfolioRefreshRunning) return res.status(409).json({ error: 'PORTFOLIO_REFRESH_BUSY' });
   const portfolio = runtimeStorage.getPortfolio();
   const supplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
   if (!supplies.length || portfolio.source === 'legacy-single-supply') return res.status(409).json({ error: 'portfolio_not_discovered' });
+  const health = runtimeStorage.getPortfolioHealth(portfolio);
+  if (portfolioHealthBlocksOperations(portfolio, health)) {
+    return res.status(409).json({ error: 'PORTFOLIO_REFRESH_REQUIRED', message: 'Redescubrí los suministros antes de sincronizar todos.' });
+  }
   const env = { ...process.env, UTE_SYNC_ALL: 'true' };
   const job = syncManager.start('sync-all', ['sync-all'], env);
   if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
   return res.status(202).json({ message: 'Sincronización de todos los suministros aceptada.', job, supplyCount: supplies.length });
 });
 
-app.get('/api/ha/summary', (req, res) => {
-  if (!requireConfiguredCredentials(res)) return;
+// Operator-only reset used for clean-install acceptance testing. It never
+// touches Home Assistant options, therefore UTE credentials remain configured.
+app.post('/api/admin/reset-local-data', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (req.get('X-UTE-Clean-Reset') !== '1' || req.body?.confirm !== 'DELETE_LOCAL_DATA') {
+    return res.status(400).json({
+      error: 'Confirmación inválida.',
+      detail: 'Se requiere X-UTE-Clean-Reset: 1 y {"confirm":"DELETE_LOCAL_DATA"}.',
+    });
+  }
+  if (syncManager.isRunning()) {
+    return res.status(409).json({ error: 'No se puede limpiar mientras hay una sincronización en curso.', job: syncManager.getStatus() });
+  }
+  const removed = clearLocalRuntimeData();
+  logEvent('warn', 'runtime.clean_reset', { removed_count: removed.length });
+  return res.status(200).json({ ok: true, removed, credentials_preserved: true });
+});
 
-  const historical = loadHistorical();
-  const current = loadPeriodoActual();
+app.get('/api/ha/summary', (req, res) => {
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (!hasDemoQuery(req) && !requireReadableSupplyContext(res)) return;
+
+  const historical = hasDemoQuery(req) ? loadDemoHistorical() : loadHistorical();
+  const current = hasDemoQuery(req) ? loadDemoCurrent() : loadPeriodoActual();
   const latest = historical[historical.length - 1] || null;
 
   res.json({
@@ -408,7 +652,9 @@ app.get('/api/ha/summary', (req, res) => {
 
 // ── Excel download ────────────────────────────────────────────────────────────
 app.get('/data/:file', (req, res) => {
-  if (!requireConfiguredCredentials(res)) return;
+  if (hasDemoQuery(req)) return res.status(404).send('Not found');
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (!hasDemoQuery(req) && !requireReadableSupplyContext(res)) return;
 
   const exportPath = resolveSafeExportPath(req.params.file);
   if (!exportPath) return res.status(404).send('Not found');
@@ -419,18 +665,19 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-app.get('/vendor/chart.umd.js', (_req, res) => {
-  res.type('application/javascript').sendFile(CHART_BUNDLE);
-});
-
 // ── Background current-period refresh ────────────────────────────────────────
 // UTE viene publicando con un atraso visible cercano a 48h, asi que alcanza
 // con refrescar el periodo actual unas pocas veces por dia.
 setInterval(() => {
   if (!hasConfiguredCredentials()) return;
   if (Date.now() < nextAutoRefreshAt) return;
-  const supplies = (runtimeStorage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
+  const portfolio = runtimeStorage.getPortfolio();
+  const health = runtimeStorage.getPortfolioHealth(portfolio);
+  if (portfolioRefreshRunning || portfolioHealthBlocksOperations(portfolio, health)) return;
+  const supplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
   if (supplies.length > 1 && !runtimeStorage.loadSelectedSupplyKey()) return;
+  const selected = runtimeStorage.loadSelectedSupplyKey();
+  if (portfolio?.source !== 'legacy-single-supply' && selected && !runtimeStorage.isSupplySyncReady(selected)) return;
   if (syncManager.isRunning()) return;
 
   const data = loadPeriodoActual();
@@ -445,8 +692,11 @@ setInterval(() => {
 }, AUTO_CURRENT_REFRESH_CHECK_MS);
 
 function scheduleInitialSync() {
-  if (!hasConfiguredCredentials() || syncManager.isRunning()) return;
-  const supplies = (runtimeStorage.getPortfolio()?.accounts || []).flatMap((account) => account.supplies || []);
+  if (!hasConfiguredCredentials() || syncManager.isRunning() || portfolioRefreshRunning) return;
+  const portfolio = runtimeStorage.getPortfolio();
+  const health = runtimeStorage.getPortfolioHealth(portfolio);
+  if (portfolioHealthBlocksOperations(portfolio, health)) return;
+  const supplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
   if (supplies.length > 1 && !runtimeStorage.loadSelectedSupplyKey()) return;
   const hasHistory = loadHistorical().length > 0;
   const hasCurrent = Boolean(loadPeriodoActual());
@@ -456,7 +706,7 @@ function scheduleInitialSync() {
 }
 
 // ── SPA ───────────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send(HTML));
+app.get('/', (req, res) => res.send(buildDashboardHTML(hasDemoQuery(req))));
 
 app.listen(PORT, () => {
   console.log('\n╔════════════════════════════════════════╗');
@@ -469,13 +719,17 @@ app.listen(PORT, () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // FRONTEND HTML (SPA)
 // ═══════════════════════════════════════════════════════════════════════════════
-const HTML = `<!DOCTYPE html>
+function buildDashboardHTML(isDemo = false) {
+  const demoBadge = isDemo
+    ? '<span class="demo-badge" aria-label="Modo demo">DEMO</span>'
+    : '';
+  return `<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>UTE Monitor</title>
-<script src="vendor/chart.umd.js"></script>
+<script src="assets/chart.umd.min.js"></script>
 <style>
   :root {
     --blue: #1a56db;
@@ -498,6 +752,8 @@ const HTML = `<!DOCTYPE html>
     --shadow-card: 0 12px 30px rgba(15, 23, 42, .07);
   }
   * { margin:0; padding:0; box-sizing:border-box; }
+  :where(*) { min-width: 0; }
+  :where(img,video,canvas,svg,iframe) { max-width: 100%; }
   body {
     font-family: 'Avenir Next', 'Segoe UI', sans-serif;
     background:
@@ -528,6 +784,22 @@ const HTML = `<!DOCTYPE html>
     letter-spacing: .01em;
   }
   .header-left span { font-size: .85rem; opacity: .8; display: block; margin-top: 2px; }
+  .demo-badge {
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,.35);
+    background: rgba(30,41,59,.45);
+    font-size: .75rem;
+    font-weight: 700;
+    letter-spacing: .02em;
+    align-self: flex-start;
+  }
+  .demo-badge-wrap {
+    margin-top: 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
   .header-right { display: flex; gap: 10px; align-items: center; }
   .btn { padding: 8px 18px; border-radius: 8px; border: none; cursor: pointer;
          font-size: .85rem; font-weight: 700; transition: all .2s; }
@@ -598,6 +870,7 @@ const HTML = `<!DOCTYPE html>
     margin-bottom: 10px;
     font-size: .8rem;
     color: var(--text-soft);
+    min-height: 2.1rem;
   }
 
   /* ── Layout ── */
@@ -616,9 +889,15 @@ const HTML = `<!DOCTYPE html>
   .filter-pills { display: flex; gap: 6px; flex-wrap: wrap; }
   .pill { padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border);
           background: #fff; cursor: pointer; font-size: .85rem; font-weight: 500;
-          color: var(--text-soft); transition: all .15s; }
+          color: var(--text-soft); transition: all .15s; font: inherit; appearance: none; }
   .pill:hover { border-color: var(--blue); color: var(--blue); }
+  .pill[aria-pressed="false"] { background: #fff; }
+  .pill:focus-visible {
+    outline: 2px solid rgba(37,99,235,.45);
+    outline-offset: 2px;
+  }
   .pill.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+  .pill[aria-pressed="true"] { background: var(--blue); color: #fff; border-color: var(--blue); }
   .filter-sep { width: 1px; height: 28px; background: var(--border); margin: 0 8px; }
   .filter-select {
     padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
@@ -664,6 +943,19 @@ const HTML = `<!DOCTYPE html>
     margin-top: 8px;
   }
   .kpi-trendnote { font-size: .72rem; color: var(--text-soft); }
+  .kpi-state {
+    display: inline-block;
+    margin-top: 6px;
+    padding: 3px 8px;
+    border-radius: 12px;
+    font-size: .72rem;
+    font-weight: 700;
+    color: #1e293b;
+    background: #f1f5f9;
+  }
+  .kpi-state.real { background: #dcfce7; color: #166534; }
+  .kpi-state.estimado { background: #ffedd5; color: #9a3412; }
+  .kpi-state.proyectado { background: #dbeafe; color: #1e40af; }
   .kpi-shadow-box {
     margin-top: 0;
     padding: 10px 12px;
@@ -812,6 +1104,55 @@ const HTML = `<!DOCTYPE html>
     border: 1px solid rgba(226,232,240,.9); overflow-x: auto;
     box-shadow: var(--shadow-card);
   }
+  .month-cards { display: none; }
+  .month-card {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px;
+    margin-bottom: 10px;
+    background: #fff;
+    box-shadow: 0 8px 16px rgba(15,23,42,.05);
+  }
+  .month-card button {
+    border: none;
+    background: transparent;
+    color: inherit;
+    width: 100%;
+    padding: 0;
+    text-align: left;
+    font: inherit;
+    cursor: pointer;
+  }
+  .month-card-main {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .month-card .month-title { font-weight: 700; font-size: .95rem; margin-bottom: 6px; }
+  .month-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: .74rem;
+    color: var(--text-soft);
+  }
+  .month-row span {
+    background: var(--bg);
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .month-card .month-detail {
+    margin-top: 8px;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: .82rem;
+  }
+  .month-card .month-detail div { min-width: 110px; }
   .table-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
   .data-table { width: 100%; border-collapse: collapse; font-size: .875rem; }
   .data-table th {
@@ -914,6 +1255,7 @@ const HTML = `<!DOCTYPE html>
   /* ── KPI hover tooltip ── */
   .kpi-has-tooltip { cursor: default; }
   .kpi-tooltip-wrap { position: relative; }
+  .kpi-tooltip-wrap[aria-expanded="true"] .kpi-tooltip { display: block; }
   .kpi-tooltip {
     display: none;
     position: absolute;
@@ -928,11 +1270,22 @@ const HTML = `<!DOCTYPE html>
     z-index: 200;
     font-size: .82rem;
     line-height: 1.4;
-    pointer-events: none;
+    pointer-events: auto;
+  }
+  .kpi-tooltip-toggle {
+    appearance: none;
+    border: none;
+    margin: 0;
+    padding: 0;
+    color: inherit;
+    background: transparent;
+    text-align: left;
+    width: 100%;
+    cursor: pointer;
+    font: inherit;
   }
   /* last two cards: align right so tooltip doesn't overflow viewport */
   .kpi-grid > :nth-last-child(-n+2) .kpi-tooltip { left: auto; right: 0; }
-  .kpi-has-tooltip:hover .kpi-tooltip { display: block; }
   .tt-title { font-weight: 700; font-size: .88rem; margin-bottom: 10px; color: var(--text); }
   .tt-section { font-size: .72rem; font-weight: 700; text-transform: uppercase;
                 letter-spacing: .05em; color: var(--text-soft); margin: 10px 0 5px; }
@@ -968,6 +1321,26 @@ const HTML = `<!DOCTYPE html>
     border: 1px solid rgba(226,232,240,.9); margin-bottom: 24px;
     box-shadow: var(--shadow-card);
   }
+  .tariff-struct-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .tariff-toggle {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 5px 10px;
+    background: #fff;
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    font-size: .78rem;
+    font-weight: 700;
+  }
+  .tariff-struct-content[hidden] { display: none; }
+  .tariff-struct-content[hidden] + * { display: none; }
   .tariff-struct-subtitle { font-size: .8rem; color: var(--text-soft); margin-top: 2px; margin-bottom: 16px; }
   .tariff-struct-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
   .tariff-col-title {
@@ -1053,6 +1426,26 @@ const HTML = `<!DOCTYPE html>
     .current-header { flex-direction: column; gap: 12px; }
     .current-header-right { width: 100%; justify-content: flex-start; }
   }
+
+  @media (max-width: 640px) {
+    .kpi-grid { grid-template-columns: 1fr; }
+    .charts-grid .chart-container { height: 250px; }
+    .table-card { overflow-x: hidden; padding: 14px; }
+    .table-card table { display: none; }
+    .month-cards { display: block; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+    .btn:hover,
+    .sync-action:hover,
+    .kpi-card:hover { transform: none; }
+  }
 </style>
 </head>
 <body>
@@ -1061,6 +1454,7 @@ const HTML = `<!DOCTYPE html>
   <div class="header-left">
     <h1>⚡ UTE Monitor</h1>
     <span>${DISPLAY_CONTEXT.accountLabel} · ${DISPLAY_CONTEXT.tariffLabel} · ${DISPLAY_CONTEXT.locationLabel}</span>
+    <div class="demo-badge-wrap">${demoBadge}</div>
   </div>
 </header>
 
@@ -1070,11 +1464,11 @@ const HTML = `<!DOCTYPE html>
   <div class="filter-bar">
     <label>Período:</label>
     <div class="filter-pills">
-      <span class="pill" data-range="3m" onclick="setRange(this)">3 meses</span>
-      <span class="pill" data-range="6m" onclick="setRange(this)">6 meses</span>
-      <span class="pill active" data-range="1y" onclick="setRange(this)">12 meses</span>
-      <span class="pill" data-range="ytd" onclick="setRange(this)">Este año</span>
-      <span class="pill" data-range="all" onclick="setRange(this)">Todo</span>
+      <button type="button" class="pill" data-range="3m" aria-pressed="false" onclick="setRange(this)">3 meses</button>
+      <button type="button" class="pill" data-range="6m" aria-pressed="false" onclick="setRange(this)">6 meses</button>
+      <button type="button" class="pill active" data-range="1y" aria-pressed="true" onclick="setRange(this)">12 meses</button>
+      <button type="button" class="pill" data-range="ytd" aria-pressed="false" onclick="setRange(this)">Este año</button>
+      <button type="button" class="pill" data-range="all" aria-pressed="false" onclick="setRange(this)">Todo</button>
     </div>
     <div class="filter-sep"></div>
     <label>Año:</label>
@@ -1303,13 +1697,21 @@ let SYNC_BUSY = false;
 let PORTFOLIO_SUPPLIES = [];
 const URUGUAY_HOLIDAYS = ${JSON.stringify(URUGUAY_HOLIDAYS)};
 const URUGUAY_HOLIDAY_SET = new Set(URUGUAY_HOLIDAYS);
+const IS_DEMO_MODE = new URLSearchParams(window.location.search).get('demo') === '1';
+
+function apiUrl(pathname) {
+  if (!IS_DEMO_MODE) return pathname;
+  return pathname.includes('?')
+    ? pathname + '&demo=1'
+    : pathname + '?demo=1';
+}
 
 const MONTHS = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
 const MONTHS_FULL = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
 
 async function loadConfigStatus() {
   try {
-    return await fetch('api/config-status').then(r => r.json());
+    return await fetch(apiUrl('api/config-status')).then(r => r.json());
   } catch (e) {
     return { credentials_configured: true, login_required: false };
   }
@@ -1328,12 +1730,12 @@ function setLoginRequiredUi(required) {
 }
 
 async function loadSupplies() {
-  let response = await fetch('api/supplies');
+  let response = await fetch(apiUrl('api/supplies'));
   let payload = await response.json();
-  if (!payload.supplies?.length || payload.source === 'legacy-single-supply') {
-    const refreshed = await fetch('api/portfolio/refresh', { method: 'POST' });
+  if (!payload.supplies?.length || payload.source === 'legacy-single-supply' || payload.needsRefresh || payload.unsafe || payload.contextIncomplete) {
+    const refreshed = await fetch(apiUrl('api/portfolio/refresh'), { method: 'POST' });
     if (refreshed.ok) {
-      response = await fetch('api/supplies');
+      response = await fetch(apiUrl('api/supplies'));
       payload = await response.json();
     } else {
       const detail = await refreshed.json().catch(() => ({}));
@@ -1366,7 +1768,7 @@ async function loadSupplies() {
 
 async function selectSupply(supplyKey) {
   if (!supplyKey) return;
-  const response = await fetch('api/supply/select', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ supplyKey }) });
+  const response = await fetch(apiUrl('api/supply/select'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ supplyKey }) });
   if (!response.ok) { document.getElementById('refreshStatus').textContent = 'No se pudo seleccionar el suministro'; return; }
   document.getElementById('refreshStatus').textContent = 'Suministro seleccionado';
   window.location.reload();
@@ -1614,7 +2016,11 @@ async function init() {
   }
 
   const supplies = await loadSupplies().catch(() => ({ supplies: [], selectionRequired: false }));
-  if (supplies.discoveryError && !(supplies.supplies || []).length) {
+  if (supplies.discoveryError && (!(supplies.supplies || []).length || supplies.unsafe || supplies.contextIncomplete)) {
+    renderDiscoveryError();
+    return;
+  }
+  if (supplies.contextIncomplete || supplies.unsafe) {
     renderDiscoveryError();
     return;
   }
@@ -1623,8 +2029,8 @@ async function init() {
     return;
   }
 
-  const data = await fetch('api/data').then(r => r.json());
-  DAILY_PERIOD_INDEX = await fetch('api/period-detail-index').then(r => r.json()).catch(() => []);
+  const data = await fetch(apiUrl('api/data')).then(r => r.json());
+  DAILY_PERIOD_INDEX = await fetch(apiUrl('api/period-detail-index')).then(r => r.json()).catch(() => []);
   HIST_DATA = data.sort((a,b) => a.año !== b.año ? a.año - b.año : a.mes - b.mes);
   rebuildAllData();
 
@@ -2557,7 +2963,7 @@ async function loadSelectedDailyPeriod(force = false) {
     MONTHS_FULL[record.mes - 1] + ' ' + record.año + '…</div>';
 
   try {
-    const url = 'api/period-detail?start=' + encodeURIComponent(bounds.start) + '&end=' + encodeURIComponent(bounds.end);
+    const url = apiUrl('api/period-detail?start=' + encodeURIComponent(bounds.start) + '&end=' + encodeURIComponent(bounds.end));
     const data = await fetch(url).then(r => r.json());
     if (requestId !== dailyDetailRequestId) return;
     if (data.error) throw new Error(data.error);
@@ -2586,14 +2992,14 @@ async function loadCurrent() {
   try {
     if (!(await ensureLoginReady())) return;
 
-    const d = await fetch('api/current').then(r => r.json());
+    const d = await fetch(apiUrl('api/current')).then(r => r.json());
     if (d.login_required) {
       renderLoginRequired();
       return;
     }
     if (d.error) throw new Error(d.error);
 
-    DAILY_PERIOD_INDEX = await fetch('api/period-detail-index').then(r => r.json()).catch(() => DAILY_PERIOD_INDEX);
+    DAILY_PERIOD_INDEX = await fetch(apiUrl('api/period-detail-index')).then(r => r.json()).catch(() => DAILY_PERIOD_INDEX);
     CURRENT_DATA = d;
     DAILY_DETAIL_CACHE.current = d;
     rebuildAllData();
@@ -2801,7 +3207,7 @@ async function waitForSync(job) {
   if (!jobId) throw new Error('No se recibió el identificador de sincronización');
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
-    const status = await fetch('api/sync-status').then(r => r.json()).catch(() => null);
+    const status = await fetch(apiUrl('api/sync-status')).then(r => r.json()).catch(() => null);
     if (!status || status.id !== jobId) {
       await new Promise(resolve => setTimeout(resolve, 1500));
       continue;
@@ -2833,7 +3239,7 @@ async function triggerDownload() {
   SYNC_BUSY = true;
   s.textContent = 'Enviando descarga completa…';
   try {
-    const response = await fetch('api/refresh', { method: 'POST' });
+    const response = await fetch(apiUrl('api/refresh'), { method: 'POST' });
     const body = await response.json().catch(() => ({}));
     if (body.login_required) {
       renderLoginRequired();
@@ -2859,7 +3265,7 @@ async function refreshCurrent() {
 
   s.innerHTML = 'Enviando actualización <span class="spinner"></span>';
   try {
-    const response = await fetch('api/refresh-current', { method: 'POST' });
+    const response = await fetch(apiUrl('api/refresh-current'), { method: 'POST' });
     const body = await response.json().catch(() => ({}));
     if (body.login_required) {
       renderLoginRequired();
@@ -2888,3 +3294,4 @@ init();
 </script>
 </body>
 </html>`;
+}

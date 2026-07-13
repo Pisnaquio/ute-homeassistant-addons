@@ -52,7 +52,7 @@ function safePortalUrl(url) {
 }
 
 class UTEScraper {
-  constructor(userId, password, debug = false) {
+  constructor(userId, password, debug = false, supplyContext = null) {
     this.userId   = userId;
     this.password = password;
     this.debug    = debug;
@@ -60,6 +60,7 @@ class UTEScraper {
     this.page     = null;
     this.portalContext = null;
     this.portfolio = null;
+    this.requestedSupplyContext = supplyContext?.technical || supplyContext || null;
   }
 
   log(msg) {
@@ -99,6 +100,11 @@ class UTEScraper {
     console.log('✅ Sesión iniciada');
     this.log(`Ruta post-login: ${safePortalUrl(url)}`);
 
+    if (this.hasCompleteRequestedSupplyContext()) {
+      this.portalContext = Object.freeze({ ...this.requestedSupplyContext });
+      return;
+    }
+
     if (url.includes('/navigateSelectUserType')) {
       this.portfolio = await discoverPortfolio(this.page);
       const supplies = this.portfolio.accounts.flatMap((account) => account.supplies || []);
@@ -126,7 +132,7 @@ class UTEScraper {
       throw new Error('Faltan meterId/badge para descargar el historial de consumo');
     }
     const url = `${BASE}/cmVerConsumo?meterId=${meterId}&tou=${tou}&uom=KWH&badge=${badge}&energia=Energía ${label} kWh`;
-    this.log(`Navegando a historial ${tou}: ${url}`);
+    this.log(`Navegando a historial ${tou}`);
 
     await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await this.page.waitForTimeout(2000);
@@ -144,6 +150,10 @@ class UTEScraper {
       fecha:   r[0],
       consumo: parseFloat(r[3]) || 0
     }));
+  }
+
+  hasCompleteRequestedSupplyContext() {
+    return ['saId', 'spId', 'meterId', 'badge'].every((key) => Boolean(this.requestedSupplyContext?.[key]));
   }
 
   // ── Descargar historial completo de facturas ──────────────────────────────
