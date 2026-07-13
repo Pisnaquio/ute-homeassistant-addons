@@ -425,14 +425,38 @@ function parseUserTypeOptions(html) {
       options.push({ index: index + 1, ids, accountNumber, label: label || `Opción ${index + 1}`, accountAlias: label || null, supplyAlias: label || null });
     }
   });
+  // Algunas cuentas llegan a navigateSelectUserType con las opciones dentro
+  // de rutas de curva embebidas en scripts, sin texto/atributos que el
+  // selector HTML anterior pueda reconocer. Cada ruta se procesa por separado
+  // para no colapsar varios suministros en el primer match global.
+  extractServiceRouteOptions(source).forEach((route, index) => {
+    const ids = extractAccountIdentifiers(route);
+    if (!ids.saId || !ids.spId) return;
+    options.push({
+      index: options.length + index + 1,
+      ids,
+      accountNumber: ids.accountNumber || null,
+      label: `Suministro detectado ${index + 1}`,
+      accountAlias: null,
+      supplyAlias: null,
+    });
+  });
   return dedupeOptions(options);
 }
 
 function stripHtml(value) { return String(value || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&'); }
+
+function extractServiceRouteOptions(source) {
+  const raw = String(source || '').replace(/&amp;/gi, '&');
+  const routeMatches = [...raw.matchAll(/cmvisualizarcurvadecarga\?[^"'\\\s<]+/gi)].map((match) => match[0]);
+  return [...new Set(routeMatches)];
+}
+
 function dedupeOptions(options) {
   const seen = new Set();
   return options.filter((option) => {
-    const key = [option.accountNumber, option.ids.saId, option.ids.spId, option.ids.meterId, option.label].join('|');
+    const technical = [option.ids.saId, option.ids.spId, option.ids.meterId, option.ids.badge].filter(Boolean);
+    const key = technical.length ? technical.join('|') : [option.accountNumber, option.label].join('|');
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
