@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5 — hotfix de selección de perfil del portal
+
+- Soporta la pantalla post-login `navigateSelectUserType` cuando UTE la auto-envía con un selector sin opción marcada explícitamente.
+- Replica sólo el valor por defecto nativo del navegador y sólo si el propio portal declara auto-submit.
+- Las selecciones manuales o ambiguas siguen bloqueadas para no elegir ni mezclar cuentas a ciegas.
+
 ## 0.3.4 — dashboard responsive y estados claros
 
 - Mejora la experiencia en desktop y mobile: tarjetas de historial, foco de teclado, tabla desplazable y orden explícito de secciones en pantallas chicas.

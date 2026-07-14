@@ -77,7 +77,13 @@ class UtePortalClient {
         this.userTypePage = response.text;
         this.userTypeOptions = parseUserTypeOptions(response.text);
         if (this.userTypeOptions.length) return response;
-        const transition = this.findSafeFormTransition(response);
+        // La pantalla de perfil puede auto-enviar un <select> cuyo primer
+        // option es el default implícito del navegador. Replicamos únicamente
+        // esa semántica cuando el portal declara auto-submit; una pantalla sin
+        // auto-submit sigue fallando cerrada ante opciones ambiguas.
+        const transition = this.findSafeFormTransition(response, {
+          allowImplicitBrowserDefault: diagnostic.autoSubmitPresent === true,
+        });
         if (!transition.ok) {
           throw this.portalError(
             transition.reason === 'selection_required' ? 'USER_TYPE_SELECTION_REQUIRED' : 'USER_TYPE_SELECTION_UNPARSEABLE',
@@ -263,10 +269,10 @@ class UtePortalClient {
     return response.text;
   }
 
-  findSafeFormTransition(response) {
+  findSafeFormTransition(response, options = {}) {
     const forms = inspectForms(response.text, response.url);
     const submissions = forms
-      .map((form) => buildSafeFormSubmission(form))
+      .map((form) => buildSafeFormSubmission(form, options))
       .filter((candidate) => candidate.ok);
     if (submissions.length !== 1) {
       return { ok: false, reason: submissions.length > 1 ? 'selection_required' : 'unparseable' };
