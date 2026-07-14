@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4 — dashboard responsive y estados claros
+
+- Mejora la experiencia en desktop y mobile: tarjetas de historial, foco de teclado, tabla desplazable y orden explícito de secciones en pantallas chicas.
+- Expone estados claros de carga, error, rango vacío y advertencias sin ocultar el último dato disponible.
+- Señala períodos provisionales o incompletos y mejora la apertura de la factura estimada desde filas o tarjetas.
+- No modifica discovery, selección ni aislamiento multicuenta de la versión 0.3.3.
+
 ## 0.3.3 — correcciones estables de discovery multicuenta
 
 - Clasifica el estado post-login con evidencia estructural, redirects y formularios seguros.

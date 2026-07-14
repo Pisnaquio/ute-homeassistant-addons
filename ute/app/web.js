@@ -804,6 +804,14 @@ function buildDashboardHTML(isDemo = false) {
   .btn { padding: 8px 18px; border-radius: 8px; border: none; cursor: pointer;
          font-size: .85rem; font-weight: 700; transition: all .2s; }
   .btn:hover { transform: translateY(-1px); }
+  .btn:focus-visible,
+  .filter-select:focus-visible,
+  .pill:focus-visible,
+  .sync-action:focus-visible,
+  .sync-summary:focus-visible {
+    outline: 2px solid rgba(59,130,246,.85);
+    outline-offset: 2px;
+  }
   .btn:disabled { opacity: .55; cursor: not-allowed; transform: none; }
   .btn-ghost { background: rgba(255,255,255,.12); color: #fff; border: 1px solid rgba(255,255,255,.12); }
   .btn-ghost:hover { background: rgba(255,255,255,.2); }
@@ -853,6 +861,7 @@ function buildDashboardHTML(isDemo = false) {
     background: rgba(255,255,255,.05);
   }
   .sync-action:hover { background: rgba(255,255,255,.12); }
+  .sync-action:focus-visible { background: rgba(255,255,255,.18); }
   .sync-action:disabled {
     opacity: .55;
     cursor: not-allowed;
@@ -1101,8 +1110,45 @@ function buildDashboardHTML(isDemo = false) {
   .table-card {
     background: linear-gradient(180deg, rgba(255,255,255,.98) 0%, rgba(248,250,252,.98) 100%);
     border-radius: 20px; padding: 20px;
-    border: 1px solid rgba(226,232,240,.9); overflow-x: auto;
+    border: 1px solid rgba(226,232,240,.9);
     box-shadow: var(--shadow-card);
+  }
+  .table-state {
+    margin-top: 8px;
+    border-radius: 10px;
+    padding: 4px 8px;
+    display: inline-block;
+    font-size: .76rem;
+  }
+  .table-state-info { background: #eff6ff; color: #1d4ed8; }
+  .table-state-warning { background: #fffbeb; color: #92400e; }
+  .table-state-error { background: #fee2e2; color: #b91c1c; }
+  .table-state-empty { background: #f1f5f9; color: #64748b; }
+  .table-scroll {
+    border: 1px solid rgba(226,232,240,.6);
+    border-radius: 14px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+  .table-hint {
+    margin-top: 8px;
+    color: var(--text-soft);
+    font-size: .72rem;
+    display: none;
+  }
+  .table-cards {
+    margin-top: 12px;
+    display: none;
+    gap: 10px;
+  }
+  .table-empty-card {
+    padding: 12px;
+    border: 1px dashed #e5e7eb;
+    border-radius: 12px;
+    color: var(--text-soft);
+    font-size: .82rem;
+    background: #f8fafc;
   }
   .month-cards { display: none; }
   .month-card {
@@ -1112,6 +1158,8 @@ function buildDashboardHTML(isDemo = false) {
     margin-bottom: 10px;
     background: #fff;
     box-shadow: 0 8px 16px rgba(15,23,42,.05);
+    display: grid;
+    gap: 8px;
   }
   .month-card button {
     border: none;
@@ -1121,7 +1169,29 @@ function buildDashboardHTML(isDemo = false) {
     padding: 0;
     text-align: left;
     font: inherit;
+    cursor: default;
+    min-width: 0;
+  }
+  .month-card .month-card-button {
+    cursor: default;
+    border: none;
+    background: transparent;
+    color: inherit;
+    width: 100%;
+    padding: 0;
+    text-align: left;
+    font: inherit;
+  }
+  .month-card .month-card-button[aria-disabled='false'] {
     cursor: pointer;
+  }
+  .month-card.selected {
+    border-color: #bfdbfe;
+    box-shadow: 0 0 0 2px rgba(59,130,246,.24);
+    background: #eff6ff;
+  }
+  .month-card[aria-disabled='true'] {
+    opacity: .74;
   }
   .month-card-main {
     display: flex;
@@ -1129,7 +1199,81 @@ function buildDashboardHTML(isDemo = false) {
     justify-content: space-between;
     gap: 10px;
   }
+  .month-card-main-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+  }
   .month-card .month-title { font-weight: 700; font-size: .95rem; margin-bottom: 6px; }
+  .month-card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .month-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 20px;
+    padding: 0 8px;
+    border-radius: 999px;
+    font-size: .68rem;
+    font-weight: 700;
+    color: #1e293b;
+    background: #f1f5f9;
+  }
+  .month-badge.provisional { color: #7c2d12; background: #ffedd5; }
+  .month-badge.interactive { color: #166534; background: #dcfce7; }
+  .month-badge.disabled { color: #6b7280; background: #eef2f7; }
+  .month-card-note {
+    font-size: .72rem;
+    color: var(--text-soft);
+    line-height: 1.35;
+  }
+  .month-card-note strong {
+    color: #111827;
+    font-weight: 700;
+  }
+  .month-card-cta {
+    justify-self: end;
+    margin-top: 2px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: #f8fafc;
+    color: var(--blue);
+    font-size: .74rem;
+    padding: 4px 10px;
+    font-weight: 700;
+    min-height: 28px;
+  }
+  .month-card-cta[aria-disabled='true'] {
+    opacity: .7;
+    cursor: not-allowed;
+  }
+  .month-card .month-card-details {
+    border-radius: 10px;
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    padding: 8px 10px;
+  }
+  .month-card .month-card-details summary {
+    font-size: .76rem;
+    color: #1d4ed8;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .month-card .month-card-details summary::marker {
+    color: #1d4ed8;
+  }
+  .month-card .month-card-details .month-row {
+    margin-top: 8px;
+  }
+  .table-cards .month-card button:focus-visible,
+  .table-cards .month-card-cta:focus-visible,
+  .table-cards .month-card .month-card-chartlink:focus-visible {
+    outline: 2px solid #1d4ed8;
+    outline-offset: 2px;
+  }
   .month-row {
     display: flex;
     flex-wrap: wrap;
@@ -1158,14 +1302,18 @@ function buildDashboardHTML(isDemo = false) {
   .data-table th {
     text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--border);
     font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-soft);
-    white-space: nowrap;
+    max-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
     position: sticky;
     top: 0;
     background: rgba(255,255,255,.96);
     backdrop-filter: blur(10px);
     z-index: 1;
   }
-  .data-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .data-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .data-table tr:focus-visible { outline: 2px solid #1d4ed8; outline-offset: -2px; }
+  .data-table tr[data-row-action='1'] { cursor: pointer; }
   .data-table tr:last-child td { border-bottom: none; }
   .data-table tr:hover td { background: var(--bg); }
   .data-table .bar-cell { width: 120px; }
@@ -1212,12 +1360,17 @@ function buildDashboardHTML(isDemo = false) {
   }
   .factura-hdr-left h3 { font-size: 1rem; font-weight: 700; letter-spacing: .02em; }
   .factura-hdr-left p  { font-size: .8rem; opacity: .8; margin-top: 3px; }
+  .factura-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border-top: 1px solid var(--border);
+  }
   .factura-badge {
     display: inline-block; padding: 3px 10px; border-radius: 12px;
     background: rgba(255,255,255,.2); font-size: .75rem; font-weight: 600;
     letter-spacing: .03em; backdrop-filter: blur(4px);
   }
-  .ftable { width: 100%; border-collapse: collapse; font-size: .875rem; }
+  .ftable { width: 100%; border-collapse: collapse; font-size: .875rem; min-width: 650px; }
   .ftable td { padding: 9px 16px; border-bottom: 1px solid #f1f5f9; }
   .ftable .fhd td {
     background: #f8fafc; font-size: .71rem; font-weight: 700; text-transform: uppercase;
@@ -1430,9 +1583,30 @@ function buildDashboardHTML(isDemo = false) {
   @media (max-width: 640px) {
     .kpi-grid { grid-template-columns: 1fr; }
     .charts-grid .chart-container { height: 250px; }
-    .table-card { overflow-x: hidden; padding: 14px; }
-    .table-card table { display: none; }
-    .month-cards { display: block; }
+    .table-card { padding: 14px; }
+    .table-scroll { overflow-x: auto; }
+    .table-cards { display: grid; }
+    .table-hint { display: block; }
+    .page {
+      display: grid;
+      grid-template-columns: 1fr;
+      grid-template-areas:
+        "filter"
+        "kpis"
+        "current"
+        "charts"
+        "table"
+        "tariff"
+        "factura";
+      gap: 18px;
+    }
+    .page > .filter-bar { grid-area: filter; }
+    .page > .kpi-grid { grid-area: kpis; }
+    .page > .current-card { grid-area: current; }
+    .page > .charts-grid { grid-area: charts; }
+    .page > .table-card { grid-area: table; }
+    .page > .tariff-struct-card { grid-area: tariff; }
+    #facturaEstimada { grid-area: factura; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -1570,23 +1744,23 @@ function buildDashboardHTML(isDemo = false) {
           <option value="current">⚡ Período actual</option>
         </select>
         <div id="cacheLabel" style="font-size:.8rem;color:var(--text-soft)"></div>
-        <details class="sync-menu" id="syncMenu" aria-disabled="false">
-          <summary class="btn btn-primary sync-summary">↻ Sincronizar</summary>
-          <div class="sync-popover">
-            <button class="sync-action" id="syncCurrentBtn" onclick="runSyncAction('current')">
-              <strong>Actualizar período actual</strong>
-              <span>Trae la última curva visible del portal. Demora cerca de 1 minuto.</span>
-            </button>
-            <button class="sync-action" id="syncFullBtn" onclick="runSyncAction('full')">
-              <strong>Descargar historial completo</strong>
-              <span>Refresca facturas, historial mensual y después vuelve a traer el período actual.</span>
-            </button>
-          </div>
-        </details>
-        <a class="btn btn-primary" href="api/diagnostic/download" download="ute-diagnostic.json" title="Descargar diagnóstico anonimizado">Diagnóstico</a>
+            <details class="sync-menu" id="syncMenu" aria-disabled="false">
+              <summary class="btn btn-primary sync-summary">↻ Sincronizar</summary>
+              <div class="sync-popover">
+              <button class="sync-action" id="syncCurrentBtn" onclick="runSyncAction('current')" aria-label="Actualizar período actual">
+                <strong>Actualizar período actual</strong>
+                <span>Trae la última curva visible del portal. Demora cerca de 1 minuto.</span>
+              </button>
+              <button class="sync-action" id="syncFullBtn" onclick="runSyncAction('full')" aria-label="Descargar historial completo">
+                <strong>Descargar historial completo</strong>
+                <span>Refresca facturas, historial mensual y después vuelve a traer el período actual.</span>
+              </button>
+            </div>
+          </details>
+          <a class="btn btn-primary" href="api/diagnostic/download" download="ute-diagnostic.json" title="Descargar diagnóstico anonimizado" aria-label="Descargar diagnóstico anonimizado">Diagnóstico</a>
+        </div>
       </div>
-    </div>
-    <div id="refreshStatus" class="sync-status"></div>
+    <div id="refreshStatus" class="sync-status" role="status" aria-live="polite"></div>
     <div id="currentContent" class="current-loading">Conectando con el portal UTE…</div>
   </div>
 
@@ -1650,25 +1824,30 @@ function buildDashboardHTML(isDemo = false) {
   <div class="table-card">
     <div class="table-header">
       <div class="section-title">📋 Detalle mensual</div>
-      <div style="font-size:.8rem;color:var(--text-soft)">👆 Hacé click en cualquier fila para ver su factura estimada abajo</div>
+      <div id="tableHint" style="font-size:.8rem;color:var(--text-soft)">👆 Entrá una fila para ver su factura estimada abajo</div>
     </div>
-    <table class="data-table" id="dataTable">
-      <thead>
-        <tr>
-          <th>Mes</th>
-          <th>Total kWh</th>
-          <th style="color:#b91c1c">Punta kWh</th>
-          <th style="color:#166534">Valle kWh</th>
-          <th style="color:#92400e">Llano kWh</th>
-          <th>Tramos</th>
-          <th>Costo total</th>
-          <th title="Energía estimada c/IVA, sin cargos fijos. Punta ~$9/kWh blended">Energía est. c/IVA</th>
-          <th title="(Costo total) / kWh — incluye todos los cargos fijos prorrateados">$/kWh efectivo</th>
-          <th>vs Promedio</th>
-        </tr>
-      </thead>
-      <tbody id="tableBody"></tbody>
-    </table>
+    <div class="table-state table-state-info" id="tableState" role="status">Cargando histórico mensual…</div>
+    <div class="table-scroll">
+      <table class="data-table" id="dataTable" aria-describedby="tableHint">
+        <thead>
+          <tr>
+            <th>Mes</th>
+            <th>Total kWh</th>
+            <th style="color:#b91c1c">Punta kWh</th>
+            <th style="color:#166534">Valle kWh</th>
+            <th style="color:#92400e">Llano kWh</th>
+            <th>Tramos</th>
+            <th>Costo total</th>
+            <th title="Energía estimada c/IVA, sin cargos fijos. Punta ~$9/kWh blended">Energía est. c/IVA</th>
+            <th title="(Costo total) / kWh — incluye todos los cargos fijos prorrateados">$/kWh efectivo</th>
+            <th>vs Promedio</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+    <div class="table-cards" id="tableCards" aria-live="polite" aria-label="Detalle mensual en tarjetas"></div>
+    <div class="table-hint" id="tableScrollHint">↔ Arrastrá la tabla horizontalmente para ver toda la grilla.</div>
   </div>
 
   <!-- Factura estimada (below table, populated by JS) -->
@@ -1708,6 +1887,127 @@ function apiUrl(pathname) {
 
 const MONTHS = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
 const MONTHS_FULL = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+
+function setTableState(kind, text) {
+  const state = document.getElementById('tableState');
+  if (!state) return;
+  const normalized = ['loading', 'empty', 'error', 'warning', 'info'].includes(kind) ? kind : 'info';
+  state.textContent = text || '';
+  state.className = 'table-state table-state-' + normalized;
+  state.dataset.state = normalized;
+}
+
+function clearMonthCards(message) {
+  const container = document.getElementById('tableCards');
+  if (!container) return;
+  container.innerHTML = '<div class="table-empty-card">' + (message || 'Sin meses para mostrar.') + '</div>';
+}
+
+function setActiveMonthSelection(idx) {
+  const rows = document.querySelectorAll('#dataTable tbody tr');
+  rows.forEach((row) => {
+    row.classList.remove('tr-selected');
+    row.removeAttribute('aria-current');
+  });
+
+  const cards = document.querySelectorAll('#tableCards .month-card');
+  cards.forEach((card, i) => {
+    card.classList.toggle('selected', i === idx);
+    card.removeAttribute('aria-current');
+    card.querySelector('.month-card-cta')?.removeAttribute('aria-current');
+  });
+
+  const selectedIdx = idx >= 0 ? rows[idx] : null;
+  if (selectedIdx) {
+    selectedIdx.classList.add('tr-selected');
+    selectedIdx.setAttribute('aria-current', 'true');
+  }
+
+  if (_tableMonths[idx]) {
+    const action = isHistoryRecordInteractive(_tableMonths[idx]);
+    const cta = cards[idx]?.querySelector('.month-card-cta');
+    if (cta && action) {
+      cta.setAttribute('aria-current', 'true');
+    }
+  }
+}
+
+function renderHistoryCards() {
+  const container = document.getElementById('tableCards');
+  if (!container) return;
+  if (!_tableMonths.length) {
+    clearMonthCards('No hay meses para mostrar.');
+    return;
+  }
+  container.innerHTML = _tableMonths.map((d, i) => renderHistoryMonthCard(d, i)).join('');
+  setActiveMonthSelection(-1);
+}
+
+function onMonthCardKeydown(event, idx) {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  const btn = event.currentTarget;
+  if (btn && btn.getAttribute('aria-disabled') === 'true') return;
+  showFacturaForMonth(idx);
+}
+
+function isHistoryRecordInteractive(d) {
+  return ((d?.punta_kwh || 0) + (d?.valle_kwh || 0) + (d?.llano_kwh || 0)) > 0;
+}
+
+function safeToLocale(number, digits = 1) {
+  return Number(number || 0).toLocaleString('es-UY', { maximumFractionDigits: digits });
+}
+
+function renderHistoryMonthCard(d, idx) {
+  const interactive = isHistoryRecordInteractive(d);
+  const totalKwh = (d.punta_kwh || 0) + (d.valle_kwh || 0) + (d.llano_kwh || 0);
+  const totalCost = d.costo_uyu || 0;
+  const title = MONTHS_FULL[d.mes - 1] + ' ' + d.año;
+  const rowLabel = getRowLabel(d);
+  const actionAttrs = interactive
+    ? ' role="button" tabindex="0" aria-disabled="false"' +
+      ' onclick="showFacturaForMonth(' + idx + ')" onkeydown="onMonthCardKeydown(event, ' + idx + ')"'
+    : ' role="button" tabindex="-1" aria-disabled="true"';
+
+  const sourceLabel = d._source === 'local-cache'
+    ? 'cache local'
+    : d._daily_only && !isHistoryRecordInteractive(d)
+      ? 'detalle diario guardado'
+      : 'histórico mensual';
+
+  return '<article class="month-card" aria-label="' + rowLabel + '">' +
+    '<div class="month-card-main">' +
+      '<div class="month-card-main-inner">' +
+        '<span class="month-title">' + title + '</span>' +
+        '<div class="month-card-meta">' +
+          (d._provisional ? '<span class="month-badge provisional">Provisional</span>' : '') +
+          (interactive ? '<span class="month-badge interactive">Con tramos</span>' : '<span class="month-badge disabled">Sin tramos</span>') +
+        '</div>' +
+        '<span class="month-card-note"><strong>Total:</strong> ' + safeToLocale(totalKwh, 2) + ' kWh</span>' +
+        '<span class="month-card-note"><strong>Costo:</strong> ' + (totalCost ? '$' + safeToLocale(totalCost, 0) : 'Sin costo') + '</span>' +
+        '<span class="month-card-note"><strong>Fuente:</strong> ' + sourceLabel + '</span>' +
+        (d._provisional ? '<span class="month-card-note"><strong>Estimado:</strong> mes provisional</span>' : '') +
+        (d.periodo_inicio && d.periodo_fin ? '<span class="month-card-note"><strong>Período:</strong> ' + d.periodo_inicio + ' → ' + d.periodo_fin + '</span>' : '') +
+      '</div>' +
+      '<button type="button" class="month-card-cta" ' + actionAttrs + ' aria-label="Ver factura estimada de ' + title + '">' +
+        (interactive ? 'Ver factura estimada' : 'Sin detalle de tramos') +
+      '</button>' +
+    '</div>' +
+    '<details class="month-card-details">' +
+      '<summary>Detalle por tramo</summary>' +
+      '<div class="month-row">' +
+        '<span style="color:#b91c1c">Punta: ' + safeToLocale(d.punta_kwh || 0, 2) + '</span>' +
+        '<span style="color:#166534">Valle: ' + safeToLocale(d.valle_kwh || 0, 2) + '</span>' +
+        '<span style="color:#92400e">Llano: ' + safeToLocale(d.llano_kwh || 0, 2) + '</span>' +
+      '</div>' +
+    '</details>' +
+  '</article>';
+}
+
+function getRowLabel(d) {
+  return 'Ver factura estimada de ' + MONTHS_FULL[d.mes - 1] + ' ' + d.año + (d._provisional ? ' (provisional)' : '');
+}
 
 async function loadConfigStatus() {
   try {
@@ -1776,6 +2076,7 @@ async function selectSupply(supplyKey) {
 
 function renderSelectionRequired(payload) {
   setLoginRequiredUi(true);
+  setTableState('warning', 'Seleccioná un suministro para continuar.');
   document.getElementById('currentPeriod').textContent = 'Seleccioná un suministro para continuar';
   document.getElementById('currentContent').className = 'current-loading';
   document.getElementById('currentContent').innerHTML = '<div class="login-card"><div class="login-eyebrow">Portfolio UTE</div><h2>Elegí el suministro</h2><p>El portal devolvió más de un suministro. Elegí uno en el selector para evitar sincronizar la cuenta equivocada.</p></div>';
@@ -1784,6 +2085,7 @@ function renderSelectionRequired(payload) {
 
 function renderDiscoveryError() {
   document.getElementById('currentPeriod').textContent = 'No se pudieron descubrir los suministros';
+  setTableState('error', 'No se pudo completar el discovery de portales.');
   document.getElementById('currentContent').className = 'current-loading';
   document.getElementById('currentContent').innerHTML = '<div class="login-card"><div class="login-eyebrow">Conexión UTE</div><h2>Necesitamos revisar el acceso</h2><p>El portal no devolvió una cuenta utilizable. Descargá el diagnóstico anonimizado y compartilo con soporte; tu contraseña y tus identificadores no se incluyen.</p><p><a href="api/diagnostic/download" download="ute-diagnostic.json">Descargar diagnóstico</a></p></div>';
   document.getElementById('refreshStatus').textContent = 'Discovery incompleto';
@@ -1808,8 +2110,10 @@ function clearHistoricalUi() {
   document.getElementById('chartSubtitle').textContent = 'Login requerido';
   document.getElementById('tramoSubtitle').textContent = 'Login requerido';
   document.getElementById('tramoPct').innerHTML = '';
+  setTableState('info', IS_DEMO_MODE ? 'Modo DEMO activo: datos de prueba y sync bloqueadas' : 'Sin historial cargado todavía.');
   document.getElementById('tableBody').innerHTML =
     '<tr><td colspan="10" style="padding:18px;text-align:center;color:#64748b">Login requerido para ver historial y detalle mensual.</td></tr>';
+  clearMonthCards('Login requerido para ver historial y detalle mensual.');
   document.getElementById('facturaEstimada').innerHTML = '';
 
   if (mainChart) {
@@ -1825,6 +2129,7 @@ function clearHistoricalUi() {
 function renderLoginRequired() {
   clearHistoricalUi();
   setLoginRequiredUi(true);
+  setTableState('warning', 'Login requerido para ver historial completo y mutaciones.');
   document.getElementById('refreshStatus').textContent = 'Login requerido';
   document.getElementById('kpiCurrent').innerHTML = '<span class="kpi-loading">Login</span>';
   document.getElementById('kpiCurrentSub').textContent = 'Configurá el add-on';
@@ -2029,15 +2334,33 @@ async function init() {
     return;
   }
 
-  const data = await fetch(apiUrl('api/data')).then(r => r.json());
-  DAILY_PERIOD_INDEX = await fetch(apiUrl('api/period-detail-index')).then(r => r.json()).catch(() => []);
-  HIST_DATA = data.sort((a,b) => a.año !== b.año ? a.año - b.año : a.mes - b.mes);
-  rebuildAllData();
+  setTableState('loading', 'Cargando historial mensual…');
+  try {
+    const dataResponse = await fetch(apiUrl('api/data'));
+    if (!dataResponse.ok) {
+      throw new Error('No se pudo descargar el histórico mensual (' + dataResponse.status + ').');
+    }
+    const data = await dataResponse.json();
 
-  populateFilterSelects();
-  populateDailyPeriodSelect();
-  applyFilter();
-  loadCurrent();
+    const periodIndexResponse = await fetch(apiUrl('api/period-detail-index'));
+    DAILY_PERIOD_INDEX = periodIndexResponse.ok ? (await periodIndexResponse.json()) : [];
+
+    HIST_DATA = data.sort((a, b) => a.año !== b.año ? a.año - b.año : a.mes - b.mes);
+    rebuildAllData();
+    populateFilterSelects();
+    populateDailyPeriodSelect();
+    applyFilter();
+    await loadCurrent();
+  } catch (e) {
+    clearHistoricalUi();
+    setTableState('error', e.message || 'No se pudo descargar el histórico mensual.');
+    document.getElementById('chartSubtitle').textContent = 'Sin datos';
+    document.getElementById('tramoSubtitle').textContent = 'Sin datos';
+    document.getElementById('tableBody').innerHTML = '<tr><td colspan="10" style="padding:18px;text-align:center;color:#64748b">No se pudo cargar el historial mensual.</td></tr>';
+    clearMonthCards('No se pudo cargar el historial mensual.');
+    updateMainChart();
+    updateTramoChart();
+  }
 }
 
 function populateFilterSelects() {
@@ -2234,7 +2557,15 @@ function setCustomRange() {
 
 function applyFilter() {
   if (!ALL_DATA.length) {
+    setTableState('empty', 'No hay datos históricos para mostrar.');
     clearHistoricalUi();
+    setTableState('empty', 'No hay datos históricos para mostrar.');
+    document.getElementById('tableBody').innerHTML =
+      '<tr><td colspan="10" style="padding:18px;text-align:center;color:#64748b">No hay datos históricos para mostrar.</td></tr>';
+    document.getElementById('chartSubtitle').textContent = 'Sin datos';
+    document.getElementById('tramoSubtitle').textContent = 'Sin datos';
+    updateMainChart();
+    updateTramoChart();
     return;
   }
 
@@ -2263,8 +2594,21 @@ function applyFilter() {
     ? MONTHS[VIEW_DATA[0].mes-1] + ' ' + VIEW_DATA[0].año + ' – ' + MONTHS[VIEW_DATA[VIEW_DATA.length-1].mes-1] + ' ' + VIEW_DATA[VIEW_DATA.length-1].año
     : '–';
 
+  if (!VIEW_DATA.length) {
+    setTableState('empty', 'No hay períodos para el rango seleccionado.');
+    document.getElementById('tableBody').innerHTML =
+      '<tr><td colspan="10" style="padding:18px;text-align:center;color:#64748b">No hay períodos para el rango actual.</td></tr>';
+    clearMonthCards('No hay períodos para el rango actual.');
+    document.getElementById('chartSubtitle').textContent  = 'Sin datos';
+    document.getElementById('tramoSubtitle').textContent  = 'Sin datos';
+    updateMainChart();
+    updateTramoChart();
+    return;
+  }
+
   document.getElementById('chartSubtitle').textContent  = subtitle;
   document.getElementById('tramoSubtitle').textContent  = subtitle;
+  setTableState('info', 'Seleccioná una fila para ver su factura estimada.');
 
   updateKPIs();
   updateMainChart();
@@ -2427,9 +2771,13 @@ function updateTable() {
     const cls  = d.consumo_kwh === maxKwh ? 'top-month' : '';
     const estEnergy = estimatedEnergyCost(d);
 
-    const hasTramos = (d.punta_kwh || 0) + (d.valle_kwh || 0) + (d.llano_kwh || 0) > 0;
-    return '<tr class="' + cls + (d._provisional ? ' tr-provisional' : '') + '"' +
-      (hasTramos ? ' onclick="showFacturaForMonth(' + i + ')" style="cursor:pointer" title="Click para ver factura estimada"' : '') + '>' +
+    const hasTramos = isHistoryRecordInteractive(d);
+    const actionAttrs = hasTramos
+      ? ' tabindex="0" role="button" data-row-action="1" aria-label="' + getRowLabel(d) + '"' +
+        ' onclick="showFacturaForMonth(' + i + ')" onkeydown="onMonthRowKeydown(event, ' + i + ')"'
+      : ' tabindex="-1" data-row-action="0" aria-label="' + getRowLabel(d) + '"';
+    return '<tr class="' + cls + (d._provisional ? ' tr-provisional' : '') + '"' + actionAttrs +
+      (hasTramos ? ' style="cursor:pointer" title="Enter para abrir factura estimada"' : '') + '>' +
       '<td class="month-label">' + MONTHS_FULL[d.mes-1] + ' ' + d.año + '</td>' +
       '<td class="kwh-total">' + d.consumo_kwh.toLocaleString('es-UY') + '</td>' +
       '<td style="color:#b91c1c">' + (d.punta_kwh||'–') + '</td>' +
@@ -2451,6 +2799,24 @@ function updateTable() {
     '</tr>';
   });
   tbody.innerHTML = rows.join('');
+  renderHistoryCards();
+  setTableState('info', 'Tabla cargada: ' + _tableMonths.length + ' filas.');
+}
+
+function onMonthRowKeydown(event, idx) {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  showFacturaForRow(idx);
+}
+
+function showFacturaForRow(idx) {
+  const rows = document.querySelectorAll('#dataTable tbody tr');
+  const row = rows[idx];
+  if (row) {
+    row.focus();
+  }
+  setActiveMonthSelection(idx);
+  showFacturaForMonth(idx);
 }
 
 // ─── Factura card renderer ────────────────────────────────────────────────────
@@ -2611,6 +2977,7 @@ function resetFactura() {
   if (_lastCurrentData) {
     document.querySelectorAll('.data-table tr.tr-selected').forEach(r => r.classList.remove('tr-selected'));
     renderFacturaCard(_lastCurrentData);
+    setActiveMonthSelection(-1);
   }
 }
 
@@ -2642,6 +3009,7 @@ function onFacturaMonthChange(val) {
 function showFacturaForMonth(idx) {
   const d = _tableMonths[idx];
   if (!d) return;
+  if (!isHistoryRecordInteractive(d)) return;
 
   // Derive period dates: billing period ends on the 27th of the month (fecha)
   // and starts on the 27th of the previous month
@@ -2669,6 +3037,7 @@ function showFacturaForMonth(idx) {
   document.querySelectorAll('.data-table tr.tr-selected').forEach(r => r.classList.remove('tr-selected'));
   const rows = document.querySelectorAll('.data-table tbody tr');
   if (rows[idx]) rows[idx].classList.add('tr-selected');
+  setActiveMonthSelection(idx);
 
   renderFacturaCard({
     ...calc,
@@ -2737,9 +3106,11 @@ function renderDailyPeriodContent(d, opts = {}) {
   const fmtKwh = n => Number(n || 0).toLocaleString('es-UY', { maximumFractionDigits: 1 });
   const sectionLabel = opts.recordLabel || 'Período actual';
 
+  const daysMissing = Math.max(0, totalDays - diasData);
   document.getElementById('currentPeriod').textContent = isCurrent
     ? 'Período actual: ' + d.periodo_inicio + ' → ' + d.periodo_fin +
-      ' · ' + diasData + ' días con datos (UTE publica con ~48h de retraso)'
+      ' · ' + diasData + ' días con datos · ' + (daysMissing > 0 ? ('faltan ' + daysMissing + ' días') : 'ciclo completo') +
+      ' (UTE publica con ~48h de retraso)'
     : sectionLabel + ' · ' + d.periodo_inicio + ' → ' + d.periodo_fin +
       ' · ' + diasData + ' días de detalle diario';
   document.getElementById('cacheLabel').textContent = opts.statusLabel || '';
@@ -3193,6 +3564,7 @@ async function loadCurrent() {
     document.getElementById('kpiCurrentSub').textContent = '';
     currentTrend.innerHTML = '';
     currentTooltipBody.innerHTML = '';
+    setTableState('error', 'No se pudo obtener datos del período actual.');
     document.getElementById('kpiEstCost').innerHTML  = '<span class="kpi-loading">No disponible</span>';
     document.getElementById('kpiEstSub').textContent = '';
     estTrend.innerHTML = '';
