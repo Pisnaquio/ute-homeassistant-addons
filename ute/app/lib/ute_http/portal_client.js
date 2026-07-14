@@ -95,7 +95,7 @@ class UtePortalClient {
         continue;
       }
       if (diagnostic.state === STATES.JS_REDIRECT_OR_AUTOSUBMIT) {
-        const transition = this.findSafeScriptTransition(response);
+        const transition = this.findSafeScriptTransition(response, diagnostic);
         if (!transition.ok) throw this.portalError('CHALLENGE_UNSUPPORTED', 'login', diagnostic);
         response = await this.submitForm(transition.submission, response.url);
         continue;
@@ -280,7 +280,15 @@ class UtePortalClient {
     return { ok: true, submission: submissions[0] };
   }
 
-  findSafeScriptTransition(response) {
+  findSafeScriptTransition(response, diagnostic = null) {
+    // Algunos pasos del portal incluyen un redirect JavaScript decorativo y
+    // un form auto-enviado que conserva el estado autenticado. El form seguro
+    // debe ganar: un redirect relativo puede resolver a la raíz del controller
+    // y perder los campos hidden necesarios para continuar.
+    if (diagnostic?.autoSubmitPresent) {
+      const formTransition = this.findSafeFormTransition(response);
+      if (formTransition.ok) return formTransition;
+    }
     const redirect = extractJsRedirect(response.text);
     if (redirect) {
       const action = safePortalUrl(redirect, response.url);

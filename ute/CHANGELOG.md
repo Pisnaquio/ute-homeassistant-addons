@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6 — hotfix de continuación post-login
+
+- Prioriza el formulario auto-enviado seguro hacia la búsqueda de cuenta cuando comparte pantalla con un redirect JavaScript.
+- Conserva los campos hidden requeridos por UTE y evita navegar a una ruta raíz inválida.
+- No cambia las reglas de selección ni aislamiento multicuenta.
+
 ## 0.3.5 — hotfix de selección de perfil del portal
 
 - Soporta la pantalla post-login `navigateSelectUserType` cuando UTE la auto-envía con un selector sin opción marcada explícitamente.
