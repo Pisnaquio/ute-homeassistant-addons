@@ -131,8 +131,9 @@ function inspectForms(html, baseUrl) {
   return forms;
 }
 
-function buildSafeFormSubmission(form) {
+function buildSafeFormSubmission(form, options = {}) {
   if (!form?.action || !isSafePortalUrl(form.action)) return { ok: false, reason: 'unsafe_action' };
+  const allowImplicitBrowserDefault = options.allowImplicitBrowserDefault === true;
   const values = {};
   for (const control of form.controls || []) {
     if (!control.name || control.disabled) continue;
@@ -141,6 +142,12 @@ function buildSafeFormSubmission(form) {
       const selected = enabled.filter((option) => option.selected);
       if (selected.length === 1) values[control.name] = selected[0].value;
       else if (enabled.length === 1) values[control.name] = enabled[0].value;
+      // HTML selecciona el primer option habilitado cuando ningún option tiene
+      // `selected`. Sólo se permite replicar ese default en una transición que
+      // el propio portal declaró auto-submit; nunca para una elección manual.
+      else if (selected.length === 0 && allowImplicitBrowserDefault && enabled.length > 0) {
+        values[control.name] = enabled[0].value;
+      }
       else return { ok: false, reason: 'selection_required' };
       continue;
     }
