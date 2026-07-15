@@ -10,21 +10,7 @@ DATA_DIR="${RUNTIME_ROOT}/data"
 REPORT_DIR="${RUNTIME_ROOT}/reportes"
 LOG_DIR="${RUNTIME_ROOT}/logs"
 TEMP_DIR="${RUNTIME_ROOT}/temp"
-SAMPLE_DIR="${APP_DIR}/sample-data"
-
 mkdir -p "${DATA_DIR}" "${REPORT_DIR}" "${LOG_DIR}" "${TEMP_DIR}"
-
-if [[ -f "${SAMPLE_DIR}/consumo.json" && ! -f "${DATA_DIR}/consumo.json" ]]; then
-  cp "${SAMPLE_DIR}/consumo.json" "${DATA_DIR}/consumo.json"
-fi
-
-if [[ -f "${SAMPLE_DIR}/periodo_actual.json" && ! -f "${DATA_DIR}/periodo_actual.json" ]]; then
-  cp "${SAMPLE_DIR}/periodo_actual.json" "${DATA_DIR}/periodo_actual.json"
-fi
-
-if [[ -d "${SAMPLE_DIR}/periodos_detalle" && ! -d "${DATA_DIR}/periodos_detalle" ]]; then
-  cp -R "${SAMPLE_DIR}/periodos_detalle" "${DATA_DIR}/periodos_detalle"
-fi
 
 export PORT=3000
 if [[ -x /usr/bin/chromium-browser ]]; then

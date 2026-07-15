@@ -1,15 +1,15 @@
 'use strict';
 
-const UTEScraper = require('./scraper');
 const { isUsablePeriodDetail } = require('./period_detail_store');
-const { UtePortalClient } = require('./ute_http/portal_client');
 const { redact } = require('./safe_log');
+const { UteMobileApiClient } = require('./ute_mobile_api/client');
+const { mobileApiPortfolio } = require('./ute_mobile_api/portfolio');
 const {
   CURRENT_DISCOVERY_REVISION,
   normalizePortalIdentity,
 } = require('./portfolio_contract');
 
-const VALID_SOURCE_MODES = new Set(['auto', 'http', 'playwright']);
+const VALID_SOURCE_MODES = new Set(['auto', 'api', 'selfservice-http', 'http', 'playwright']);
 const DISCOVERY_FAIL_CLOSED_CODES = new Set([
   'INVALID_CREDENTIALS',
   'SESSION_EXPIRED',
@@ -30,18 +30,34 @@ function createUteDataSource(options) {
 
 class UteDataSource {
   constructor(options = {}) {
+    this.document = options.document;
     this.userId = options.userId;
     this.password = options.password;
     this.debug = !!options.debug;
     this.mode = normalizeMode(options.mode);
     this.supplyContext = options.supplyContext || null;
     this.httpClient = null;
+    this.mobileApiClient = null;
     this.playwrightSessionTouched = false;
-    this.playwrightScraperFactory = options.playwrightScraperFactory || (() =>
-      new UTEScraper(this.userId, this.password, this.debug));
+    this.mobileApiFactory = options.mobileApiFactory || (() => new UteMobileApiClient({ document: this.document, password: this.password }));
+    this.playwrightScraperFactory = options.playwrightScraperFactory || (() => {
+      const UTEScraper = require('./scraper');
+      return new UTEScraper(this.userId, this.password, this.debug);
+    });
   }
 
   async discoverPortfolio() {
+    if ((this.mode === 'api' || this.mode === 'auto') && this.document) {
+      const client = await this.getMobileApiClient();
+      const discovered = await client.discoverPortfolio();
+      this.portfolio = mobileApiPortfolio(discovered);
+      return this.portfolio;
+    }
+    if (this.mode === 'api') {
+      const error = new Error('Falta ute_document para usar la API móvil de UTE.');
+      error.code = 'MISSING_API_DOCUMENT';
+      throw error;
+    }
     if (this.mode === 'playwright') return this.discoverPortfolioWithPlaywright(null);
     try {
       const client = await this.getHttpClient({ allowUnselected: true });
@@ -50,7 +66,7 @@ class UteDataSource {
       if (!portfolio?.accounts?.length) throw new Error('UTE no devolvió cuentas ni suministros');
       return portfolio;
     } catch (error) {
-      if (this.mode === 'http') throw error;
+      if (this.mode === 'selfservice-http') throw error;
       if (DISCOVERY_FAIL_CLOSED_CODES.has(error.code)) throw error;
       return this.discoverPortfolioWithPlaywright(error);
     }
@@ -84,6 +100,11 @@ class UteDataSource {
 
   async fetchMonthlyData(options = {}) {
     this.setSupplyContext(options.supplyContext);
+    if (this.usesMobileApi()) {
+      const error = new Error('La API móvil aún no tiene un contrato validado para historial mensual.');
+      error.code = 'CAPABILITY_UNSUPPORTED';
+      throw error;
+    }
     return this.runOperation(
       'monthly',
       async () => {
@@ -105,8 +126,62 @@ class UteDataSource {
     );
   }
 
+  async fetchLegacyMonthlyData() {
+    if (!this.hasLegacyCredentials()) {
+      const error = new Error('Falta ute_user para complementar el histórico que la API no publica.');
+      error.code = 'LEGACY_CREDENTIALS_REQUIRED';
+      throw error;
+    }
+    const startedAt = Date.now();
+    const client = await this.getLegacyPortalClient();
+    const data = await client.fetchFullMonthlyDataset();
+    if (!Array.isArray(data) || !data.length) {
+      const error = new Error('SelfService devolvió historial mensual vacío.');
+      error.code = 'CAPABILITY_UNSUPPORTED';
+      throw error;
+    }
+    return this.wrapResult('monthly', 'selfservice-http', wrapParsedRows(data), startedAt, { fallbackFrom: 'mobile-api', fallbackReasonCode: 'CAPABILITY_UNSUPPORTED' });
+  }
+
   async fetchCurrentPeriod(options = {}) {
     this.setSupplyContext(options.supplyContext);
+    if (this.usesMobileApi()) {
+      const api = await this.getMobileApiClient();
+      const mobile = this.supplyContext?.providers?.mobileApi;
+      if (Number(this.supplyContext?.portfolioSupplyCount || 0) > 1) {
+        const error = new Error('El resumen corriente API es de cuenta y no se atribuye a un suministro en una cartera múltiple.');
+        error.code = 'CAPABILITY_UNSUPPORTED';
+        throw error;
+      }
+      if (!mobile?.accountId || !mobile?.servicePointId) {
+        const error = new Error('El suministro API no tiene identidad técnica completa.');
+        error.code = 'CAPABILITY_UNSUPPORTED';
+        throw error;
+      }
+      const simulation = await api.simulation(mobile.accountId);
+      const plan = String(mobile.tariff || '');
+      const summary = simulation.body || {};
+      const from = options.dateFrom || summary.initialDate;
+      const to = options.dateTo || summary.finalDate;
+      const tou = plan && from && to ? await api.tou(mobile.servicePointId, plan, from, to) : { body: null, statusCode: 204 };
+      const bands = Array.isArray(tou.body) ? tou.body : [];
+      const byTou = (name) => bands.filter((item) => String(item.tou || '').toUpperCase() === name)
+        .reduce((total, item) => total + Number(item.consumption || 0), 0);
+      return this.wrapResult('current', 'mobile-api', {
+        periodo_inicio: from || null,
+        periodo_fin: to || null,
+        consumo_kwh: Number(summary.currentConsumption || 0),
+        costo_uyu: Number(summary.currentSpending || 0),
+        punta_kwh: byTou('PUNTA'),
+        valle_kwh: byTou('VALLE'),
+        llano_kwh: byTou('LLANO'),
+        dias: [],
+        account_level: true,
+        tou: bands,
+        capability: 'supported',
+        dailyCapability: 'unsupported',
+      }, Date.now());
+    }
     return this.runOperation(
       'current',
       async () => {
@@ -131,6 +206,27 @@ class UteDataSource {
 
   async fetchPeriodDetail(periodoInicio, periodoFin, options = {}) {
     this.setSupplyContext(options.supplyContext);
+    if (this.usesMobileApi()) {
+      if (!this.hasLegacyCredentials()) {
+        const error = new Error('La curva diaria requiere ute_user de SelfService mientras la API no publique esa capacidad.');
+        error.code = 'LEGACY_CREDENTIALS_REQUIRED';
+        throw error;
+      }
+      if (this.hasMultiSupplyContext() && !this.hasCompleteSupplyContextForLegacy()) {
+        const error = new Error('El fallback legacy diario requiere el contexto portal completo del mismo suministro.');
+        error.code = 'PORTFOLIO_CONTEXT_INCOMPLETE';
+        throw error;
+      }
+      const startedAt = Date.now();
+      const client = await this.getLegacyPortalClient();
+      const data = await client.fetchPeriodDetail(periodoInicio, periodoFin, options);
+      if (!isUsablePeriodDetail(data)) {
+        const error = new Error('SelfService devolvió curva diaria inválida.');
+        error.code = 'CAPABILITY_UNSUPPORTED';
+        throw error;
+      }
+      return this.wrapResult('period-detail', 'selfservice-http', data, startedAt, { fallbackFrom: 'mobile-api', fallbackReasonCode: 'CAPABILITY_UNSUPPORTED' });
+    }
     return this.runOperation(
       'period-detail',
       async () => {
@@ -159,11 +255,13 @@ class UteDataSource {
       await close();
       this.playwrightSessionTouched = false;
     }
+    if (this.mobileApiClient) await this.mobileApiClient.close();
   }
 
   async getHttpClient(options = {}) {
     const allowUnselected = options.allowUnselected === true;
     if (!this.httpClient) {
+      const { UtePortalClient } = require('./ute_http/portal_client');
       this.httpClient = new UtePortalClient({
         userId: this.userId,
         password: this.password,
@@ -182,6 +280,29 @@ class UteDataSource {
       throw error;
     }
     return this.httpClient;
+  }
+
+  async getMobileApiClient() {
+    if (!this.mobileApiClient) {
+      this.mobileApiClient = this.mobileApiFactory();
+      await this.mobileApiClient.login();
+    }
+    return this.mobileApiClient;
+  }
+
+  async getLegacyPortalClient() {
+    const { UtePortalClient } = require('./ute_http/portal_client');
+    const client = new UtePortalClient({ userId: this.userId, password: this.password });
+    await client.login();
+    const portfolio = await client.discoverPortfolio();
+    const supplies = (portfolio.accounts || []).flatMap((account) => account.supplies || []);
+    if (supplies.length !== 1) {
+      const error = new Error('El complemento legacy requiere una correspondencia portal única; no se infiere en multicuenta.');
+      error.code = 'PORTFOLIO_CONTEXT_INCOMPLETE';
+      throw error;
+    }
+    client.setSupplyContext(supplies[0].technical);
+    return client;
   }
 
   setSupplyContext(context) {
@@ -205,7 +326,7 @@ class UteDataSource {
       const httpResult = await httpFn();
       return this.wrapResult(operation, 'http', httpResult, startedAt);
     } catch (error) {
-      if (this.mode === 'http') {
+      if (this.mode === 'selfservice-http') {
         throw error;
       }
       if (this.hasMultiSupplyContext() && !this.hasCompleteSupplyContext()) {
@@ -230,6 +351,12 @@ class UteDataSource {
     const technical = this.supplyContext?.technical || this.supplyContext || {};
     return ['saId', 'spId', 'meterId', 'badge'].every((key) => Boolean(technical[key]));
   }
+
+  hasCompleteSupplyContextForLegacy() { return this.hasCompleteSupplyContext(); }
+
+  hasLegacyCredentials() { return Boolean(this.userId && this.password); }
+
+  usesMobileApi() { return Boolean(this.document && (this.mode === 'api' || this.mode === 'auto')); }
 
   wrapResult(operation, source, data, startedAt, extra = {}) {
     return {
@@ -272,6 +399,7 @@ function finalizePlaywrightPortfolio(rawPortfolio) {
 
 function normalizeMode(value) {
   const mode = String(value || 'auto').toLowerCase();
+  if (mode === 'http') return 'selfservice-http';
   return VALID_SOURCE_MODES.has(mode) ? mode : 'auto';
 }
 

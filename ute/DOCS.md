@@ -6,7 +6,8 @@ Hostea la UI completa de UTE dentro de Home Assistant usando Ingress. No usa `pa
 
 ## Configuración
 
-- `ute_email`: usuario de UTE
+- `ute_document`: CI/RUT/BPS para API móvil UTE
+- `ute_user`: usuario de SelfService para histórico/curva diaria cuando corresponda
 - `ute_password`: contraseña de UTE
 - `debug`: habilita logs más verbosos
 - `timezone`: zona horaria para el runtime
@@ -20,13 +21,12 @@ Los datos viven en `/data/ute` dentro del almacenamiento persistente del app:
 - `/data/ute/logs`
 - `/data/ute/temp`
 
-El paquete estable no trae consumo precargado. Los datos se crean localmente
-después de configurar las credenciales y ejecutar la primera sincronización.
+El paquete público no incluye datos iniciales ni información de otras cuentas.
 
 ## Uso
 
 1. Instalar el app local desde `Settings > Apps`.
-2. Abrir la configuración del app y cargar `ute_email` y `ute_password`.
+2. Abrir la configuración del app y cargar las credenciales propias.
 3. Iniciar el app.
 4. Abrir `UTE` desde la sidebar.
 

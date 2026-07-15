@@ -2,6 +2,8 @@ const XLSX = require('xlsx');
 const fs = require('fs-extra');
 const path = require('path');
 
+const ALLOWED_XLSX_FILE_RE = /^consumo_ute_\d{4}\.xlsx$/i;
+
 class DataProcessor {
   constructor(dataDir = 'data') {
     this.dataDir = dataDir;
@@ -209,9 +211,9 @@ class DataProcessor {
       }
     }
 
-    // Fallback: read from Excel files (no tramo data)
-    try {
-      const files = fs.readdirSync(this.dataDir).filter(f => f.endsWith('.xlsx'));
+      // Fallback: read from Excel files (no tramo data)
+      try {
+      const files = fs.readdirSync(this.dataDir).filter((f) => ALLOWED_XLSX_FILE_RE.test(f));
       const allData = [];
 
       for (const file of files) {

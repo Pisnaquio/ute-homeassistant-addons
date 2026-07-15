@@ -36,6 +36,9 @@ function setEnvIfMissing(key, value) {
   }
 }
 
+// `ute_document` es exclusivo de la API móvil. No se infiere desde el
+// usuario legacy: puede ser CI/RUT/BPS y tiene semántica distinta.
+setEnvIfMissing('UTE_DOCUMENT', addonOptions.ute_document);
 setEnvIfMissing('UTE_EMAIL', firstNonEmpty(addonOptions.ute_user, addonOptions.ute_email));
 setEnvIfMissing('UTE_PASSWORD', addonOptions.ute_password);
 setEnvIfMissing('DEBUG', addonOptions.debug === true ? 'true' : null);
@@ -44,14 +47,14 @@ setEnvIfMissing('TZ', addonOptions.timezone);
 const runtimeName = firstNonEmpty(process.env.UTE_RUNTIME_NAME, 'ute');
 const runtimeRoot = isAddonRuntime
   ? path.join('/data', runtimeName)
-  : firstNonEmpty(process.env.UTE_RUNTIME_ROOT, path.join('/tmp', runtimeName));
+  : firstNonEmpty(process.env.UTE_DEV_RUNTIME_ROOT, path.join('/tmp', runtimeName));
 
 const runtimePaths = {
   appRoot: APP_ROOT,
   runtimeRoot,
   dataDir: isAddonRuntime
     ? path.join(runtimeRoot, 'data')
-    : firstNonEmpty(process.env.UTE_DATA_ROOT, path.join(APP_ROOT, 'data')),
+    : firstNonEmpty(process.env.UTE_DEV_DATA_ROOT, path.join(APP_ROOT, 'data')),
   reportDir: isAddonRuntime ? path.join(runtimeRoot, 'reportes') : path.join(APP_ROOT, 'reportes'),
   logDir: isAddonRuntime ? path.join(runtimeRoot, 'logs') : path.join(APP_ROOT, 'logs'),
   tempDir: isAddonRuntime ? path.join(runtimeRoot, 'temp') : path.join(APP_ROOT, 'temp'),

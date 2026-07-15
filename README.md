@@ -8,7 +8,8 @@ Este repo contiene:
 - `ute/` con el canal estable listo para instalar
 
 El addon levanta una UI local dentro de Home Assistant y descarga datos del
-portal de UTE usando Playwright dentro del contenedor del propio addon.
+API móvil de UTE como fuente preferida y complementa histórico/curvas mediante
+SelfService cuando esa capacidad no existe en la API.
 
 ## Que necesita el usuario
 
@@ -34,7 +35,8 @@ la instancia destino.
 3. Agregar la URL del repositorio como custom repository.
 4. Instalar `UTE`.
 5. Configurar:
-  - `ute_user` (número de cuenta o usuario de UTE; no es un email)
+  - `ute_document` (CI/RUT/BPS para la API móvil UTE)
+  - `ute_user` (usuario de SelfService, necesario para histórico y curvas diarias)
    - `ute_password`
 6. Iniciar el addon y abrir `UTE` desde la sidebar.
 

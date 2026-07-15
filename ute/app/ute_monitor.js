@@ -15,7 +15,7 @@ const { redact, logEvent } = require('./lib/safe_log');
 const { RuntimeStorage } = require('./lib/runtime_storage');
 
 const VERSION = '1.0.0';
-const VALID_PORTAL_SOURCE_MODES = new Set(['auto', 'http', 'playwright']);
+const VALID_PORTAL_SOURCE_MODES = new Set(['auto', 'api', 'selfservice-http', 'http', 'playwright']);
 
 function safeErrorMessage(error) {
   return redact(error?.message || error || 'error desconocido');
@@ -83,6 +83,7 @@ function normalizePortalSourceMode(value) {
 
 class UTEMonitor {
   constructor() {
+    this.apiDocument = process.env.UTE_DOCUMENT;
     this.scraperEmail = process.env.UTE_EMAIL;
     this.scraperPassword = process.env.UTE_PASSWORD;
     this.debugMode = process.env.DEBUG === 'true';
@@ -160,7 +161,9 @@ class UTEMonitor {
   }
 
   validateCredentials() {
-    if (!this.scraperEmail || !this.scraperPassword) {
+    const apiReady = Boolean(this.apiDocument && this.scraperPassword);
+    const legacyReady = Boolean(this.scraperEmail && this.scraperPassword);
+    if (!apiReady && !legacyReady) {
       const detail = isAddonRuntime
         ? 'Configurá Usuario UTE / número de cuenta y contraseña en Settings > Apps > UTE > Configuration.'
         : 'Configurá UTE_EMAIL (usuario o número de cuenta, no email) y UTE_PASSWORD en el entorno local.';
@@ -173,6 +176,7 @@ class UTEMonitor {
   createDataSource() {
     const active = this.supplyKey ? this.storage.getActiveContext(this.supplyKey) : null;
     return createUteDataSource({
+      document: this.apiDocument,
       userId: this.scraperEmail,
       password: this.scraperPassword,
       debug: this.debugMode,
@@ -242,6 +246,23 @@ class UTEMonitor {
       this.validateCredentials();
       source = this.createDataSource();
       await this.ensureSupplyPortfolio(source);
+      if (source.usesMobileApi?.()) {
+        // Charts API sigue opaco: el histórico se complementa por SelfService
+        // sólo cuando hay credenciales legacy explícitas, no por error API.
+        if (!source.hasLegacyCredentials?.()) {
+          const cached = this.processor.loadExistingData();
+          await this.currentPeriod();
+          this.log('Historial API no disponible: se conservó el cache local vigente.', 'warn');
+          return cached;
+        }
+        const monthlyResult = await source.fetchLegacyMonthlyData();
+        this.logSourceResult(monthlyResult);
+        const parsedData = this.processor.parseConsumptionData(monthlyResult.data);
+        const mergedData = this.processor.mergeData(this.processor.loadExistingData(), parsedData);
+        this.processor.saveConsumoJson(mergedData);
+        await this.currentPeriod();
+        return mergedData;
+      }
       const monthlyResult = await source.fetchMonthlyData();
       this.logSourceResult(monthlyResult);
       const rawData = monthlyResult.data;

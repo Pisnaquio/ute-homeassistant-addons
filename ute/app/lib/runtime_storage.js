@@ -34,6 +34,17 @@ function hasCompleteSupplyTechnical(supply) {
   return ['saId', 'spId', 'meterId', 'badge'].every((key) => Boolean(technical[key]));
 }
 
+function hasCompleteMobileApiIdentity(supply) {
+  const api = supply?.providers?.mobileApi || {};
+  return ['accountId', 'serviceAgreementId', 'servicePointId'].every((key) => Boolean(api[key]));
+}
+
+function isSupplyOperational(supply, source) {
+  return String(source || '').startsWith('mobile-api')
+    ? hasCompleteMobileApiIdentity(supply)
+    : hasCompleteSupplyTechnical(supply);
+}
+
 class RuntimeStorage {
   constructor(runtimePaths) {
     this.runtimeRoot = runtimePaths.runtimeRoot || runtimePaths.appRoot || '/tmp/ute-runtime';
@@ -171,7 +182,7 @@ class RuntimeStorage {
     const keys = supplies.map((supply) => supply.supplyKey).filter(Boolean);
     const duplicateKeyCount = Math.max(0, keys.length - new Set(keys).size);
     const { duplicateIdentityCount, identityConflictCount } = portfolioIdentityIssues(supplies);
-    const incompleteCount = supplies.filter((supply) => !hasCompleteSupplyTechnical(supply)).length;
+    const incompleteCount = supplies.filter((supply) => !isSupplyOperational(supply, portfolio?.source)).length;
     return {
       supplyCount: supplies.length,
       duplicateKeyCount,
@@ -275,6 +286,23 @@ class RuntimeStorage {
         this._migrateLegacyDataToSupply(legacyKey);
         nextSupplies[0].supplyKey = legacyKey;
         assignedKeys.add(legacyKey);
+      }
+    }
+
+    // Los proveedores no comparten IDs de suministro. La única promoción
+    // automática admitida es 1→1 con la misma identidad de cuenta: conserva
+    // el namespace y la selección, pero nunca colapsa una cartera múltiple.
+    const oldAccount = oldPortfolio.accounts?.[0];
+    const nextAccount = next.accounts?.[0];
+    const isProviderTransition = oldPortfolio.source !== next.source &&
+      oldPortfolio.source !== 'legacy-single-supply' &&
+      oldSupplies.length === 1 && nextSupplies.length === 1 &&
+      oldAccount?.accountId && oldAccount.accountId === nextAccount?.accountId;
+    if (isProviderTransition) {
+      const oldKey = oldSupplies[0].supplyKey;
+      if (isSafeSupplyKey(oldKey)) {
+        nextSupplies[0].supplyKey = oldKey;
+        assignedKeys.add(oldKey);
       }
     }
 
@@ -506,7 +534,7 @@ class RuntimeStorage {
     const selectedSupply = selected
       ? supplies.find((supply) => supply.supplyKey === selected)
       : null;
-    if (selectedSupply && (portfolio.source === 'legacy-single-supply' || hasCompleteSupplyTechnical(selectedSupply))) {
+    if (selectedSupply && (portfolio.source === 'legacy-single-supply' || isSupplyOperational(selectedSupply, portfolio.source))) {
       return selected;
     }
     if (selected) fs.removeSync(this.selectionPath);
@@ -514,7 +542,7 @@ class RuntimeStorage {
     // elegimos silenciosamente el primero: eso puede sincronizar la cuenta
     // equivocada y fue la causa del fallo de la versión single-supply.
     if (supplies.length !== 1) return null;
-    if (portfolio.source !== 'legacy-single-supply' && !hasCompleteSupplyTechnical(supplies[0])) return null;
+    if (portfolio.source !== 'legacy-single-supply' && !isSupplyOperational(supplies[0], portfolio.source)) return null;
     this._setSelectedSupplyKeyUnlocked(supplies[0].supplyKey);
     return supplies[0].supplyKey;
   }
@@ -542,7 +570,7 @@ class RuntimeStorage {
     const supply = portfolio.accounts
       .flatMap((account) => account.supplies || [])
       .find((candidate) => candidate.supplyKey === normalized);
-    return hasCompleteSupplyTechnical(supply);
+    return isSupplyOperational(supply, portfolio.source);
   }
 
   getSupplyRoot(supplyKey) {
@@ -775,7 +803,7 @@ function portfoliosEquivalent(left, right) {
 
 function assertDiscoveredPortfolioOperable(portfolio) {
   const supplies = (portfolio?.accounts || []).flatMap((account) => account.supplies || []);
-  if (!supplies.length || supplies.some((supply) => !hasCompleteSupplyTechnical(supply))) {
+  if (!supplies.length || supplies.some((supply) => !isSupplyOperational(supply, portfolio?.source))) {
     const error = new Error('El discovery no produjo contextos técnicos completos; se conservó el portfolio anterior.');
     error.code = 'PORTFOLIO_CONTEXT_INCOMPLETE';
     throw error;
@@ -839,7 +867,7 @@ function assertPortfolioShrinkSafe(previous, next, recoveryPlan, suppliesRoot) {
     new Set(oldKeys).size !== oldKeys.length ||
     duplicateIdentityCount > 0 ||
     identityConflictCount > 0;
-  const oldIsIncomplete = oldSupplies.some((supply) => !hasCompleteSupplyTechnical(supply));
+  const oldIsIncomplete = oldSupplies.some((supply) => !isSupplyOperational(supply, oldPortfolio.source));
   const oldDiscovery = Number(oldPortfolio.discoveryRevision || 0);
   if (oldDiscovery < CURRENT_DISCOVERY_REVISION || oldIsUnsafe || oldIsIncomplete) return;
 

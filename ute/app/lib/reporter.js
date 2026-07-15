@@ -1,6 +1,5 @@
 const fs = require('fs-extra');
 const path = require('path');
-const CHART_BUNDLE = path.join(__dirname, '..', 'assets', 'chart.umd.min.js');
 
 class ReportGenerator {
   constructor(reportDir = 'reportes') {
@@ -36,7 +35,6 @@ class ReportGenerator {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reporte UTE - ${monthNames[month - 1] || 'Consumo'} ${year}</title>
-    <script src="./chart.umd.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -611,7 +609,6 @@ class ReportGenerator {
         `reporte_${year}_${String(month).padStart(2, '0')}.html`
       );
 
-      fs.copyFileSync(CHART_BUNDLE, path.join(this.reportDir, 'chart.umd.min.js'));
       fs.writeFileSync(filename, html);
       console.log(`✅ Reporte guardado en: ${filename}`);
       return filename;

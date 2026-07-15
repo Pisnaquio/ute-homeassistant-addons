@@ -1,31 +1,20 @@
 # Changelog
 
-## 0.3.6 — hotfix de continuación post-login
+## 0.3.7 — API-first con complemento de datos legacy
 
-- Prioriza el formulario auto-enviado seguro hacia la búsqueda de cuenta cuando comparte pantalla con un redirect JavaScript.
-- Conserva los campos hidden requeridos por UTE y evita navegar a una ruta raíz inválida.
-- No cambia las reglas de selección ni aislamiento multicuenta.
+- Agrega cliente clean-room de la API móvil UTE con OAuth en memoria, allowlist HTTPS y diagnóstico saneado.
+- `ute_document` es explícito para CI/RUT/BPS; `ute_user` queda disponible para complementar capacidades que la API no expone.
+- Discovery y selección usan identidad técnica API; un suministro no autorizado no se puede seleccionar.
+- La migración 1→1 conserva selección y cache sólo cuando se demuestra la misma cuenta; los casos ambiguos no reemplazan datos.
+- La API resuelve discovery y consumo actual. Histórico mensual y curva diaria se complementan desde SelfService cuando se configura `ute_user`, sin caer a scraping por errores de API.
 
-## 0.3.5 — hotfix de selección de perfil del portal
-
-- Soporta la pantalla post-login `navigateSelectUserType` cuando UTE la auto-envía con un selector sin opción marcada explícitamente.
-- Replica sólo el valor por defecto nativo del navegador y sólo si el propio portal declara auto-submit.
-- Las selecciones manuales o ambiguas siguen bloqueadas para no elegir ni mezclar cuentas a ciegas.
-
-## 0.3.4 — dashboard responsive y estados claros
-
-- Mejora la experiencia en desktop y mobile: tarjetas de historial, foco de teclado, tabla desplazable y orden explícito de secciones en pantallas chicas.
-- Expone estados claros de carga, error, rango vacío y advertencias sin ocultar el último dato disponible.
-- Señala períodos provisionales o incompletos y mejora la apertura de la factura estimada desde filas o tarjetas.
-- No modifica discovery, selección ni aislamiento multicuenta de la versión 0.3.3.
-
-## 0.3.3 — correcciones estables de discovery multicuenta
+## 0.1.22-rc.1 — discovery multicuenta (campo privado)
 
 - Clasifica el estado post-login con evidencia estructural, redirects y formularios seguros.
 - Conserva campos hidden requeridos para transiciones GET/POST y admite redirects JS deterministas.
 - Mantiene la canonicalización de suministros y bloquea contextos ambiguos o incompletos.
 - El fallback Playwright requiere un `SupplyContext` técnico completo; no puede elegir ni mezclar suministros.
-- Incluye diagnóstico seguro para confirmar la variante de portal del usuario sin exponer credenciales ni identificadores técnicos.
+- No promocionar: requiere validación externa de discovery, selección, sync-one, sync-all y cambio de suministro.
 
 ## 0.1.21
 
@@ -64,7 +53,7 @@
 
 - Mueve el control de sincronizacion al bloque del periodo diario y elimina los botones viejos del header.
 - Ajusta el auto-refresh interno para refrescar solo el periodo actual varias veces por dia.
-- Usa un runtime persistente aislado del addon estable.
+- Separa `ute` como runtime default del addon dev.
 
 ## 0.1.3
 

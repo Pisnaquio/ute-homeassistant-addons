@@ -72,12 +72,14 @@ function normalizeSupply(raw) {
     }))
     : [];
 
+  const providers = raw.providers && typeof raw.providers === 'object' ? raw.providers : {};
+  const mobile = providers.mobileApi || {};
   return {
     supplyKey: preserveOrComputeKey(
       raw.supplyKey,
-      [accountId, accountNumber, normalizeString(raw.supplyId), technical.saId, technical.spId]
+      [accountId, accountNumber, normalizeString(raw.supplyId), technical.saId, technical.spId, mobile.serviceAgreementId, mobile.servicePointId]
         .filter(Boolean).length > 2
-        ? [accountId, accountNumber, normalizeString(raw.supplyId), technical.saId, technical.spId]
+        ? [accountId, accountNumber, normalizeString(raw.supplyId), technical.saId, technical.spId, mobile.serviceAgreementId, mobile.servicePointId]
         : [accountId, accountNumber, supplyAlias, normalizeString(raw.location)]
     ),
     alias: supplyAlias,
@@ -86,6 +88,7 @@ function normalizeSupply(raw) {
     tariffs: Array.isArray(raw.tariffs) ? raw.tariffs.map(normalizeTariff) : [],
     meters,
     technical,
+    providers,
     selectedByDefault: !!raw.selectedByDefault,
   };
 }
@@ -147,6 +150,7 @@ function createSupplyContext(portfolio, supplyKey) {
     supplyAlias: supply.alias,
     location: supply.location,
     technical: Object.freeze({ ...(supply.technical || {}) }),
+    providers: Object.freeze({ ...(supply.providers || {}) }),
     capabilities: Object.freeze({ ...(supply.capabilities || {}) }),
   });
 }

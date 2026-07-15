@@ -1,5 +1,5 @@
 name: "UTE"
-version: "0.3.6"
+version: "0.3.7"
 slug: "ute"
 description: "Dashboard y descarga de consumo UTE dentro de Home Assistant"
 url: "https://developers.home-assistant.io/docs/apps/"
@@ -18,12 +18,14 @@ panel_icon: "mdi:flash"
 panel_admin: true
 watchdog: "http://[HOST]:[PORT:3000]/health"
 options:
+  ute_document: ""
   ute_user: ""
   ute_email: ""
   ute_password: ""
   debug: false
   timezone: "America/Montevideo"
 schema:
+  ute_document: "str?"
   ute_user: "str?"
   ute_email: "str?"
   ute_password: "password?"
