@@ -551,6 +551,58 @@ class UTEMonitor {
     }
   }
 
+  async backfillMissingPeriodDetails() {
+    let source = null;
+    try {
+      console.log(chalk.bold.cyan('\n🗂 RECUPERANDO PERÍODOS DIARIOS PENDIENTES\n'));
+      const existing = this.processor.loadExistingData();
+      const pending = existing
+        .map((record) => ({ record, bounds: buildBillingPeriodBounds(record.año, record.mes) }))
+        .filter(({ record, bounds }) => Number.isInteger(record.año) && Number.isInteger(record.mes) &&
+          !loadPeriodDetail(this.dataDir, bounds.start, bounds.end));
+
+      if (!pending.length) {
+        console.log(chalk.green('✅ No hay períodos diarios pendientes.'));
+        return { saved: 0, skipped: existing.length, failed: [], pending: 0 };
+      }
+
+      this.validateCredentials();
+      source = this.createDataSource();
+      await this.ensureSupplyPortfolio(source);
+      const fetchedAt = new Date().toISOString();
+      const results = { saved: 0, skipped: existing.length - pending.length, failed: [], pending: pending.length };
+
+      for (const { record, bounds } of pending) {
+        const label = monthLabel(record.año, record.mes);
+        try {
+          console.log(chalk.cyan(`• ${label}: consultando UTE (${bounds.start} → ${bounds.end})...`));
+          const detailResult = await source.fetchPeriodDetail(bounds.start, bounds.end, {
+            quiet: true,
+            fallbackTotals: record,
+          });
+          this.logSourceResult(detailResult);
+          const savedPath = savePeriodDetail(this.dataDir, detailResult.data, { storedAt: fetchedAt });
+          if (!savedPath) throw new Error('el período no pasó la validación para persistirse localmente');
+          results.saved += 1;
+          console.log(chalk.green(`  ✓ Guardado ${label} (${detailResult.data.consumo_kwh} kWh)`));
+        } catch (error) {
+          results.failed.push({ label, error: safeErrorMessage(error), periodoInicio: bounds.start, periodoFin: bounds.end });
+          console.log(chalk.yellow(`  ⚠ No se pudo guardar ${label}: ${safeErrorMessage(error)}`));
+        }
+      }
+
+      console.log(chalk.green(`\n✅ Recuperación terminada: ${results.saved} guardados, ${results.failed.length} pendientes para reintentar.`));
+      this.log(`Recuperación de detalle diario: ${results.saved} guardados, ${results.failed.length} pendientes`);
+      return results;
+    } catch (error) {
+      this.log(`Error recuperando detalle diario pendiente: ${error.message}`, 'error');
+      console.error(chalk.red(`\n❌ Error: ${safeErrorMessage(error)}\n`));
+      throw error;
+    } finally {
+      if (source) await source.close().catch(() => {});
+    }
+  }
+
   async analyze(data = null) {
     try {
       console.log(chalk.bold.cyan('\n📈 ANALIZANDO DATOS DE CONSUMO\n'));
@@ -773,6 +825,10 @@ class UTEMonitor {
         desc: 'Guardar detalle diario mensual en cache local (YYYY-MM YYYY-MM)'
       },
       {
+        cmd: 'backfill-missing-period-details',
+        desc: 'Recuperar únicamente los períodos diarios que faltan'
+      },
+      {
         cmd: 'help',
         desc: 'Mostrar este mensaje'
       }
@@ -788,6 +844,7 @@ class UTEMonitor {
     console.log(chalk.white('  node ute_monitor.js report      # Generar reporte'));
     console.log(chalk.white('  node ute_monitor.js period-detail 27-04-2026 26-05-2026   # Curva diaria de un período'));
     console.log(chalk.white('  node ute_monitor.js backfill-period-details 2023-05 2026-05   # Cachear varios meses'));
+    console.log(chalk.white('  node ute_monitor.js backfill-missing-period-details   # Reintentar solo los meses pendientes'));
     console.log(chalk.white('  node ute_monitor.js schedule    # Descargar automáticamente\n'));
 
     console.log(chalk.bold('CONFIGURACIÓN:\n'));
@@ -850,6 +907,10 @@ class UTEMonitor {
         await this.backfillPeriodDetails(startYm, endYm);
         break;
       }
+
+      case 'backfill-missing-period-details':
+        await this.backfillMissingPeriodDetails();
+        break;
 
       case 'help':
       case '--help':

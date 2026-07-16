@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.9 — Períodos diarios históricos recuperables
+
+- Agrega “Completar períodos anteriores” al menú Sincronizar.
+- Muestra cuántos períodos diarios ya están guardados y cuántos quedan pendientes.
+- Reintenta únicamente los períodos faltantes; los ya persistidos no se vuelven a consultar.
+
 ## 0.3.8 — Compatibilidad con token OAuth de UTE
 
 - Acepta respuestas OAuth válidas cuando UTE omite el `scope` sin cambiarlo o no rota el `refresh_token`.
