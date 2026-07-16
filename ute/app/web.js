@@ -265,6 +265,54 @@ function loadPeriodDetailIndex() {
   }
 }
 
+function getBillingPeriodForMonthlyRecord(record) {
+  const year = Number(record?.año);
+  const month = Number(record?.mes);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) return null;
+
+  const previousMonth = month === 1 ? 12 : month - 1;
+  const previousYear = month === 1 ? year - 1 : year;
+  return {
+    key: `${year}-${String(month).padStart(2, '0')}`,
+    periodo_inicio: `27-${String(previousMonth).padStart(2, '0')}-${previousYear}`,
+    periodo_fin: `27-${String(month).padStart(2, '0')}-${year}`,
+  };
+}
+
+function getPeriodDetailCoverage() {
+  const dataRoot = activeDataDir();
+  const uniquePeriods = new Map();
+
+  for (const record of loadHistorical()) {
+    const period = getBillingPeriodForMonthlyRecord(record);
+    if (period) uniquePeriods.set(period.key, period);
+  }
+
+  const periods = [...uniquePeriods.values()].sort((a, b) => a.key.localeCompare(b.key));
+  const available = [];
+  const missing = [];
+
+  for (const period of periods) {
+    const detail = dataRoot
+      ? loadPeriodDetail(dataRoot, period.periodo_inicio, period.periodo_fin)
+      : null;
+    if (detail?.periodo_inicio === period.periodo_inicio && detail?.periodo_fin === period.periodo_fin) {
+      available.push(period);
+    } else {
+      missing.push(period);
+    }
+  }
+
+  return {
+    total: periods.length,
+    available: available.length,
+    missing: missing.length,
+    first_period: periods[0]?.key || null,
+    last_period: periods.at(-1)?.key || null,
+    pending_periods: missing.map((period) => period.key),
+  };
+}
+
 function parsePortalDateServer(text) {
   const [d, m, y] = String(text || '').split('-').map(Number);
   return new Date(y, (m || 1) - 1, d || 1);
@@ -524,6 +572,15 @@ app.get('/api/period-detail-index', (req, res) => {
   res.json(loadPeriodDetailIndex());
 });
 
+app.get('/api/period-detail-coverage', (req, res) => {
+  if (hasDemoQuery(req)) {
+    return res.json({ supported: false, total: 0, available: 0, missing: 0, pending_periods: [] });
+  }
+  if (!requireConfiguredCredentials(req, res)) return;
+  if (!requireReadableSupplyContext(res)) return;
+  return res.json({ supported: true, ...getPeriodDetailCoverage() });
+});
+
 app.get('/api/period-detail', (req, res) => {
   if (!requireConfiguredCredentials(req, res)) return;
   if (hasDemoQuery(req)) {
@@ -604,6 +661,38 @@ app.post('/api/refresh-current', (req, res) => {
   const job = startSync('current', ['current']);
   if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
   return res.status(202).json({ message: 'Actualización de período actual aceptada.', job });
+});
+
+app.post('/api/period-detail-backfill', (req, res) => {
+  if (hasDemoQuery(req)) return res.status(404).json({ error: 'not_available_in_demo' });
+  if (!hasConfiguredCredentials()) {
+    return res.status(428).json(missingCredentialsPayload());
+  }
+  if (!requireSelectedSupplyForMutation(res)) return;
+
+  const coverage = getPeriodDetailCoverage();
+  if (!coverage.total) {
+    return res.status(409).json({
+      error: 'monthly_history_required',
+      message: 'Primero descargá el historial mensual para saber qué períodos diarios faltan.',
+      coverage,
+    });
+  }
+  if (!coverage.missing) {
+    return res.status(200).json({
+      message: 'Los períodos diarios ya están completos.',
+      coverage,
+      job: null,
+    });
+  }
+
+  const job = startSync('period-detail-backfill', ['backfill-missing-period-details']);
+  if (!job) return res.status(409).json({ error: 'Ya hay una sincronización en curso.', job: syncManager.getStatus() });
+  return res.status(202).json({
+    message: `Recuperación de ${coverage.missing} períodos diarios aceptada.`,
+    coverage,
+    job,
+  });
 });
 
 app.post('/api/refresh-all', (req, res) => {
@@ -1589,6 +1678,10 @@ function buildDashboardHTML(isDemo = false) {
               <strong>Descargar historial completo</strong>
               <span>Refresca facturas, historial mensual y después vuelve a traer el período actual.</span>
             </button>
+            <button class="sync-action" id="syncHistoricalBtn" onclick="runSyncAction('historical')" disabled>
+              <strong>Completar períodos anteriores</strong>
+              <span id="historicalBackfillHint">Calculando períodos diarios pendientes…</span>
+            </button>
           </div>
         </details>
         <a class="btn btn-primary" href="api/diagnostic/download" download="ute-diagnostic.json" title="Descargar diagnóstico anonimizado">Diagnóstico</a>
@@ -2045,6 +2138,7 @@ async function init() {
   populateFilterSelects();
   populateDailyPeriodSelect();
   applyFilter();
+  await refreshHistoricalBackfillUi();
   loadCurrent();
 }
 
@@ -3237,6 +3331,33 @@ async function waitForSync(job) {
   throw new Error('La sincronización sigue en curso. Revisá el estado y los logs del add-on.');
 }
 
+function formatHistoricalBackfillHint(coverage) {
+  if (!coverage?.supported) return 'Disponible al usar tus datos reales.';
+  if (!coverage.total) return 'Primero descargá el historial mensual.';
+  if (!coverage.missing) return '✓ ' + coverage.available + '/' + coverage.total + ' períodos diarios listos.';
+  return coverage.available + '/' + coverage.total + ' listos · faltan ' + coverage.missing + ' para recuperar.';
+}
+
+async function refreshHistoricalBackfillUi() {
+  const button = document.getElementById('syncHistoricalBtn');
+  const hint = document.getElementById('historicalBackfillHint');
+  if (!button || !hint) return null;
+
+  try {
+    const response = await fetch(apiUrl('api/period-detail-coverage'));
+    const coverage = await response.json().catch(() => null);
+    if (!response.ok || !coverage) throw new Error('No se pudo calcular el estado de los períodos.');
+
+    hint.textContent = formatHistoricalBackfillHint(coverage);
+    button.disabled = !coverage.supported || !coverage.missing || SYNC_BUSY;
+    return coverage;
+  } catch (error) {
+    hint.textContent = 'No pudimos calcular qué períodos faltan todavía.';
+    button.disabled = true;
+    return null;
+  }
+}
+
 async function triggerDownload() {
   const s = document.getElementById('refreshStatus');
   if (!(await ensureLoginReady())) return;
@@ -3291,10 +3412,55 @@ async function refreshCurrent() {
   SYNC_BUSY = false;
 }
 
+async function triggerHistoricalBackfill() {
+  const s = document.getElementById('refreshStatus');
+  if (!(await ensureLoginReady())) return;
+  if (SYNC_BUSY) {
+    s.textContent = 'Ya hay una sincronización en curso.';
+    return;
+  }
+
+  const before = await refreshHistoricalBackfillUi();
+  if (!before?.missing) {
+    s.textContent = before?.total
+      ? '✓ Los períodos diarios ya están completos.'
+      : 'Primero descargá el historial mensual.';
+    return;
+  }
+
+  SYNC_BUSY = true;
+  s.textContent = 'Recuperando ' + before.missing + ' períodos diarios pendientes…';
+  try {
+    const response = await fetch(apiUrl('api/period-detail-backfill'), { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (body.login_required) {
+      renderLoginRequired();
+      return;
+    }
+    if (!response.ok) throw new Error(body.message || body.error || 'No se pudo iniciar la recuperación histórica.');
+    if (!body.job) {
+      s.textContent = '✓ Los períodos diarios ya están completos.';
+      return;
+    }
+
+    await waitForSync(body.job);
+    const after = await refreshHistoricalBackfillUi();
+    s.textContent = after?.missing
+      ? 'Se guardaron los períodos disponibles. Quedan ' + after.missing + ' para reintentar.'
+      : '✓ Períodos diarios históricos completos.';
+  } catch (error) {
+    s.textContent = 'Error: ' + error.message;
+  } finally {
+    SYNC_BUSY = false;
+    await refreshHistoricalBackfillUi();
+  }
+}
+
 function runSyncAction(action) {
   const syncMenu = document.getElementById('syncMenu');
   if (syncMenu) syncMenu.open = false;
   if (action === 'full') return triggerDownload();
+  if (action === 'historical') return triggerHistoricalBackfill();
   return refreshCurrent();
 }
 
