@@ -15,6 +15,16 @@ function basic(client, secret) {
   return `Basic ${Buffer.from(`${client}:${secret}`).toString('base64')}`;
 }
 
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function hasAllowedTokenScope(scope) {
+  // RFC 6749 permits omitting `scope` when it is unchanged from the request.
+  // When UTE does include it, keep the fail-closed check for a different scope.
+  return scope === undefined || scope === null || scope === ALLOWED_SCOPE;
+}
+
 class UteMobileApiClient {
   constructor(options = {}) {
     this.document = options.document;
@@ -40,11 +50,18 @@ class UteMobileApiClient {
   async login() {
     if (!this.document || !this.password) throw apiError('INVALID_CREDENTIALS', 'Falta documento o contraseña para la API de UTE.');
     if (!this.bootstrapState) await this.bootstrap();
-    const token = await this._token({ grant_type: 'password', username: this.document, password: this.password });
-    // ROPC necesita estos valores una sola vez: no quedan retenidos luego de
-    // crear la sesión renovable en memoria.
-    this.document = null;
-    this.password = null;
+    const token = await this._token({
+      grant_type: 'password',
+      username: this.document,
+      password: this.password,
+      scope: this.bootstrapState.scope,
+    });
+    // ROPC necesita estos valores una sola vez cuando UTE entrega refresh token.
+    // Si no lo entrega, se conservan únicamente en memoria para reautenticar.
+    if (this.session.refreshToken) {
+      this.document = null;
+      this.password = null;
+    }
     await this._loggedIn();
     return { scope: token.scope };
   }
@@ -52,11 +69,17 @@ class UteMobileApiClient {
   async _token(form) {
     const response = await this.transport.request({ authority: this.bootstrapState.authority, expectedHost: IDENTITY_HOST, pathname: '/connect/token', method: 'POST', headers: { authorization: basic(this.bootstrapState.client, this.bootstrapState.secret) }, form });
     const body = assertObject(response.body, 'Token');
-    if (!body.access_token || !body.refresh_token || !Number.isFinite(Number(body.expires_in)) || body.scope !== ALLOWED_SCOPE) {
+    const expiresIn = Number(body.expires_in);
+    if (!nonEmptyString(body.access_token) || !Number.isFinite(expiresIn) || expiresIn <= 0 || !hasAllowedTokenScope(body.scope)) {
       throw apiError('API_SCHEMA_INVALID', 'La respuesta OAuth de UTE es inválida.');
     }
-    this.session = { accessToken: body.access_token, refreshToken: body.refresh_token, expiresAt: this.now() + Math.max(0, Number(body.expires_in) - 60) * 1000 };
-    return { scope: body.scope };
+    const returnedRefreshToken = nonEmptyString(body.refresh_token) ? body.refresh_token : null;
+    this.session = {
+      accessToken: body.access_token,
+      refreshToken: returnedRefreshToken || this.session?.refreshToken || null,
+      expiresAt: this.now() + Math.max(0, expiresIn - 60) * 1000,
+    };
+    return { scope: body.scope || this.bootstrapState.scope };
   }
 
   async _loggedIn() {

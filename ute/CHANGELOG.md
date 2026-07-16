@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.8 — Compatibilidad con token OAuth de UTE
+
+- Acepta respuestas OAuth válidas cuando UTE omite el `scope` sin cambiarlo o no rota el `refresh_token`.
+- Sigue bloqueando scopes distintos, tokens vacíos y respuestas sin vencimiento válido.
+- Conserva el refresh token anterior cuando la renovación no devuelve uno nuevo.
+
 ## 0.3.7 — API-first con complemento de datos legacy
 
 - Agrega cliente clean-room de la API móvil UTE con OAuth en memoria, allowlist HTTPS y diagnóstico saneado.
