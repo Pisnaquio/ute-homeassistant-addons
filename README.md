@@ -40,11 +40,19 @@ la instancia destino.
    - `ute_password`
 6. Iniciar el addon y abrir `UTE` desde la sidebar.
 
-## Estado recomendado del repo
+## Estado del proyecto
 
-Mientras siga pendiente la validacion con cuentas ajenas y una instancia limpia
-de Home Assistant, conviene mantener este repositorio como privado. Cuando esa
-validacion cierre bien, se puede volver publico sin cambiar la estructura.
+UTE 0.3.10 es el cierre funcional del proyecto y queda en mantenimiento. La
+arquitectura final es API-first híbrida: la API móvil resuelve autenticación,
+discovery y consumo corriente; SelfService complementa histórico mensual y
+curva diaria.
+
+- Single-supply: soportado.
+- Multi-supply: experimental, no GA.
+- Nuevas funcionalidades: congeladas.
+- Mantenimiento: cambios de contrato UTE, tarifa, seguridad y bugs reproducibles.
+
+Ver [`ute/SUPPORT.md`](./ute/SUPPORT.md) para el alcance completo.
 
 ### Opcion 2: copia manual / zip
 
