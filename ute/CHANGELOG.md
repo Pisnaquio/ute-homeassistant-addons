@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.10 — cierre de mantenimiento
+
+- Corrige el fallback Playwright mensual cuando SelfService HTTP no puede completar la operación.
+- Declara API-first híbrido como arquitectura final: API móvil para autenticación, discovery y consumo corriente; SelfService para histórico y curva diaria.
+- Define single-supply como alcance soportado y multi-supply como experimental, sin garantía GA.
+- Congela nuevas funcionalidades; futuros cambios quedan limitados a compatibilidad, seguridad, tarifa y bugs reproducibles.
+
 ## 0.3.9 — Períodos diarios históricos recuperables
 
 - Agrega “Completar períodos anteriores” al menú Sincronizar.

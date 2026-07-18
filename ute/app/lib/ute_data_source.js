@@ -40,9 +40,9 @@ class UteDataSource {
     this.mobileApiClient = null;
     this.playwrightSessionTouched = false;
     this.mobileApiFactory = options.mobileApiFactory || (() => new UteMobileApiClient({ document: this.document, password: this.password }));
-    this.playwrightScraperFactory = options.playwrightScraperFactory || (() => {
+    this.playwrightScraperFactory = options.playwrightScraperFactory || ((supplyContext = this.supplyContext) => {
       const UTEScraper = require('./scraper');
-      return new UTEScraper(this.userId, this.password, this.debug);
+      return new UTEScraper(this.userId, this.password, this.debug, supplyContext);
     });
   }
 
@@ -116,7 +116,7 @@ class UteDataSource {
         return wrapParsedRows(data);
       },
       async () => {
-        const scraper = new UTEScraper(this.userId, this.password, this.debug, this.supplyContext);
+        const scraper = this.playwrightScraperFactory(this.supplyContext);
         try {
           return await scraper.scrapeWithRetry();
         } finally {
