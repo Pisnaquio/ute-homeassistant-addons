@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.11 — facturas cerradas automáticas
+
+- Detecta cuando el período actual avanzó pero falta el mes cerrado o su factura real.
+- Reintenta una descarga completa como máximo una vez cada 24 horas hasta incorporar la factura publicada por UTE.
+- Mantiene el refresco liviano del período actual cuando el historial ya está al día.
+
 ## 0.3.10 — cierre de mantenimiento
 
 - Corrige el fallback Playwright mensual cuando SelfService HTTP no puede completar la operación.

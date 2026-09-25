@@ -9,6 +9,11 @@ const { URUGUAY_HOLIDAYS } = require('./lib/uruguay_holidays');
 const { ensureRuntimeDirs, runtimePaths } = require('./lib/runtime_env');
 const { buildDisplayContext } = require('./lib/portal_context');
 const { SyncManager } = require('./lib/sync_manager');
+const {
+  evaluateAutoHistoryRefresh,
+  readAutoHistoryState,
+  writeAutoHistoryState,
+} = require('./lib/auto_history_refresh');
 const { logEvent, redact } = require('./lib/safe_log');
 const { RuntimeStorage } = require('./lib/runtime_storage');
 const { createUteDataSource } = require('./lib/ute_data_source');
@@ -321,6 +326,8 @@ function parsePortalDateServer(text) {
 const syncManager = new SyncManager({ cwd: __dirname, statePath: SYNC_STATE_PATH });
 const AUTO_CURRENT_REFRESH_MAX_AGE_MS = 8 * 60 * 60 * 1000;
 const AUTO_CURRENT_REFRESH_CHECK_MS = 3 * 60 * 60 * 1000;
+const AUTO_HISTORY_REFRESH_RETRY_MS = 24 * 60 * 60 * 1000;
+const AUTO_HISTORY_STATE_PATH = path.join(runtimePaths.tempDir, 'history-auto-state.json');
 let nextAutoRefreshAt = 0;
 let portfolioRefreshRunning = false;
 
@@ -762,10 +769,11 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ── Background current-period refresh ────────────────────────────────────────
-// UTE viene publicando con un atraso visible cercano a 48h, asi que alcanza
-// con refrescar el periodo actual unas pocas veces por dia.
-setInterval(() => {
+// ── Background refresh ────────────────────────────────────────────────────────
+// El periodo actual se refresca unas pocas veces por dia. Si el periodo ya
+// avanzo pero falta el mes cerrado o su factura, se prueba una descarga
+// completa como maximo una vez cada 24 horas.
+function scheduleAutomaticRefresh() {
   if (!hasConfiguredCredentials()) return;
   if (Date.now() < nextAutoRefreshAt) return;
   const portfolio = runtimeStorage.getPortfolio();
@@ -777,16 +785,48 @@ setInterval(() => {
   if (portfolio?.source !== 'legacy-single-supply' && selected && !runtimeStorage.isSupplySyncReady(selected)) return;
   if (syncManager.isRunning()) return;
 
-  const data = loadPeriodoActual();
-  const ageMs = data
-    ? Date.now() - new Date(data.fetched_at).getTime()
+  const historical = loadHistorical();
+  const current = loadPeriodoActual();
+  const historyDecision = evaluateAutoHistoryRefresh({
+    historical,
+    current,
+    state: readAutoHistoryState(AUTO_HISTORY_STATE_PATH),
+    supplyKey: selected,
+    nowMs: Date.now(),
+    retryMs: AUTO_HISTORY_REFRESH_RETRY_MS,
+  });
+
+  if (historyDecision.shouldRefresh) {
+    logEvent('info', 'sync.auto_requested', {
+      kind: 'history',
+      reason: historyDecision.reason,
+      expected_year: historyDecision.expectedYear,
+      expected_month: historyDecision.expectedMonth,
+    });
+    const job = startSync('history-auto', ['download']);
+    if (job) {
+      writeAutoHistoryState(AUTO_HISTORY_STATE_PATH, {
+        supplyKey: selected,
+        lastAttemptAt: new Date().toISOString(),
+        expectedYear: historyDecision.expectedYear,
+        expectedMonth: historyDecision.expectedMonth,
+      });
+    }
+    nextAutoRefreshAt = Date.now() + AUTO_CURRENT_REFRESH_CHECK_MS + Math.floor(Math.random() * 15 * 60 * 1000);
+    return;
+  }
+
+  const ageMs = current
+    ? Date.now() - new Date(current.fetched_at).getTime()
     : Infinity;
   if (ageMs > AUTO_CURRENT_REFRESH_MAX_AGE_MS) {
     logEvent('info', 'sync.auto_requested', { kind: 'current' });
     startSync('current-auto', ['current']);
     nextAutoRefreshAt = Date.now() + AUTO_CURRENT_REFRESH_CHECK_MS + Math.floor(Math.random() * 15 * 60 * 1000);
   }
-}, AUTO_CURRENT_REFRESH_CHECK_MS);
+}
+
+setInterval(scheduleAutomaticRefresh, AUTO_CURRENT_REFRESH_CHECK_MS);
 
 function scheduleInitialSync() {
   if (!hasConfiguredCredentials() || syncManager.isRunning() || portfolioRefreshRunning) return;
@@ -811,6 +851,7 @@ app.listen(PORT, () => {
   console.log(`║  🌐 http://localhost:${PORT}              ║`);
   console.log('╚════════════════════════════════════════╝\n');
   setTimeout(scheduleInitialSync, 750);
+  setTimeout(scheduleAutomaticRefresh, 15 * 1000);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
