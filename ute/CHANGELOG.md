@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.12 — Node.js con parches de seguridad
+
+- Actualiza el runtime a Node.js 24.22.1, que corrige las vulnerabilidades publicadas el 20 de octubre de 2026 (incluida la ejecución remota de código en el decodificador Brotli, CVE-2026-111497, y varios bypass de validación de certificados TLS).
+- Node se toma de la imagen oficial `node:24.22.1-alpine3.24`, fijada por digest, porque Alpine 3.24 todavía publica 24.18.1 sin esos parches.
+- La imagen falla al construirse si la versión de Node no es la esperada.
+- Sin cambios funcionales en la app.
+
 ## 0.3.11 — facturas cerradas automáticas
 
 - Detecta cuando el período actual avanzó pero falta el mes cerrado o su factura real.
