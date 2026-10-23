@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.13 — dependencias con parches de seguridad
+
+- Actualiza dependencias transitivas dentro de los rangos declarados: corrige la alerta crítica de `proxy-addr` y las de `qs`, `brace-expansion` y `body-parser`.
+- `xlsx` pasa a la distribución oficial de SheetJS 0.20.3 (`cdn.sheetjs.com`), porque npm quedó congelado en 0.18.5 sin los arreglos de ReDoS y prototype pollution.
+- Playwright sube a 1.63 dentro del rango declarado. Sin cambios funcionales en la app.
+
 ## 0.3.12 — Node.js con parches de seguridad
 
 - Actualiza el runtime a Node.js 24.22.1, que corrige las vulnerabilidades publicadas el 20 de octubre de 2026 (incluida la ejecución remota de código en el decodificador Brotli, CVE-2026-111497, y varios bypass de validación de certificados TLS).
