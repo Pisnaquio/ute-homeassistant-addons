@@ -1,0 +1,26 @@
+# Dependabot: revisa las dependencias una vez por semana y abre PRs.
+# Las versiones menores y de parche van juntas en un solo PR por ecosistema;
+# las mayores llegan por separado. Los PRs de seguridad no cuentan para el límite.
+version: 2
+updates:
+  # Aplicación Node del add-on.
+  - package-ecosystem: npm
+    directory: /ute/app
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # Imagen de Node fijada por versión y digest en el Dockerfile.
+  - package-ecosystem: docker
+    directory: /ute
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]
+
+# Sin entrada para github-actions: el repo todavía no tiene workflows.
