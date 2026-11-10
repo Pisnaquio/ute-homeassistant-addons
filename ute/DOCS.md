@@ -48,3 +48,4 @@ El paquete público no incluye datos iniciales ni información de otras cuentas.
 - Este app conserva Chromium/Playwright sólo como fallback legacy acotado.
 - Si la descarga en vivo falla, la UI sigue mostrando los datos persistidos ya guardados.
 - La versión 0.3.10 queda en mantenimiento: no se planifican nuevas funcionalidades.
+- Desde 0.3.14 la UI y la API sólo responden a través del panel de Home Assistant (Ingress). Otros add-ons reciben 403, salvo las lecturas `/health` y `/api/ha/summary`.

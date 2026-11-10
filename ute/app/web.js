@@ -17,10 +17,12 @@ const {
 const { logEvent, redact } = require('./lib/safe_log');
 const { RuntimeStorage } = require('./lib/runtime_storage');
 const { createUteDataSource } = require('./lib/ute_data_source');
+const { createIngressGuard } = require('./lib/ingress_guard');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 const DISPLAY_CONTEXT = buildDisplayContext();
+app.use(createIngressGuard());
 app.use(express.json());
 app.set('query parser', 'simple');
 ensureRuntimeDirs();

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.14 — control de origen y parches de dependencias
+
+- La interfaz y la API sólo responden al Supervisor de Home Assistant (Ingress y watchdog) y al propio contenedor. Otros add-ons de la red interna reciben 403; siguen abiertas las lecturas `/health` y `/api/ha/summary`.
+- Actualiza `body-parser` y `qs` dentro de los rangos declarados (denegación de servicio).
+- Sin cambios funcionales en la app.
+
 ## 0.3.13 — dependencias con parches de seguridad
 
 - Actualiza dependencias transitivas dentro de los rangos declarados: corrige la alerta crítica de `proxy-addr` y las de `qs`, `brace-expansion` y `body-parser`.
