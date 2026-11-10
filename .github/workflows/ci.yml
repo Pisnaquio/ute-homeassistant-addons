@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the add-on version has a changelog entry
+        run: |
+          version="$(sed -n 's/^version: "\(.*\)"$/\1/p' ute/config.yaml)"
+          if [ -z "${version}" ]; then
+            echo "ci: no version found in ute/config.yaml" >&2
+            exit 1
+          fi
+          if ! grep -Eq "^## ${version//./\\.}( |\$)" ute/CHANGELOG.md; then
+            echo "ci: ute/CHANGELOG.md has no '## ${version}' entry" >&2
+            exit 1
+          fi
+          echo "ci: version ${version} has a changelog entry"
+
+      # Test on the exact Node.js release the add-on image ships.
+      - name: Read the Node.js version from the Dockerfile
+        id: node
+        run: |
+          version="$(sed -n 's/^FROM node:\([0-9][0-9.]*\)-.*$/\1/p' ute/Dockerfile | head -n 1)"
+          if [ -z "${version}" ]; then
+            echo "ci: no Node.js version found in ute/Dockerfile" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+          cache: npm
+          cache-dependency-path: ute/app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ute/app
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: npm ci
+
+      - name: Syntax check
+        run: |
+          find ute/app -path ute/app/node_modules -prune -o -path ute/app/assets -prune \
+            -o -name '*.js' -print0 | xargs -0 -n 1 node --check
+          bash -n ute/run.sh
+
+      - name: Run tests
+        working-directory: ute/app
+        run: node --test
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Reads package-lock.json only. Fails on high or critical advisories in
+      # the dependencies that ship inside the add-on image.
+      - name: Audit production dependencies
+        working-directory: ute/app
+        run: npm audit --omit=dev --audit-level=high
