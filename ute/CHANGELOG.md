@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.15 — Node.js 26 y dependencias al día
+
+- La imagen pasa de Node.js 24.22.1 a 26.13.0.
+- `chalk` 4 → 6 y `dotenv` 16 → 18; `express` 5.3, `node-schedule` 2.1.2 y `playwright` 1.65 dentro de sus rangos.
+- `dotenv` queda en modo silencioso para que el log del add-on no cambie.
+- Sin cambios funcionales en la app.
+
 ## 0.3.14 — control de origen y parches de dependencias
 
 - La interfaz y la API sólo responden al Supervisor de Home Assistant (Ingress y watchdog) y al propio contenedor. Otros add-ons de la red interna reciben 403; siguen abiertas las lecturas `/health` y `/api/ha/summary`.

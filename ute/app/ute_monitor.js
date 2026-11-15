@@ -2,7 +2,8 @@
 
 const fs = require('fs-extra');
 const path = require('path');
-const chalk = require('chalk');
+// chalk 6 is ESM-only; require() of an ES module returns its namespace.
+const chalk = require('chalk').default;
 const schedule = require('node-schedule');
 
 const DataProcessor = require('./lib/processor');

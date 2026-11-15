@@ -1,2 +1,5 @@
 .DS_Store
 Thumbs.db
+
+# Dependencies are installed with npm ci, never committed
+node_modules/

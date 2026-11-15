@@ -1,6 +1,7 @@
 # Node.js comes from the official image instead of Alpine's nodejs package:
-# Alpine 3.24 still ships 24.18.1, without the 2026-10-20 security fixes.
-FROM node:24.22.1-alpine3.24@sha256:feb76650b7195319268c59cb2d419c732d6c499b13bf5296f16ab59eb1f0a4f3 AS node
+# Alpine 3.24 only packages 24.18.1, without the 2026-10-20 security fixes.
+# The version is asserted below so a changed tag cannot slip in unnoticed.
+FROM node:26.13.0-alpine3.24@sha256:8996bb5821d62a8fd9bb27c1cb07462f3fdce6e47d640c6a881ead0b064ce216 AS node
 
 FROM ghcr.io/home-assistant/base:latest
 
@@ -28,7 +29,7 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
   && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
-  && test "$(node --version)" = "v24.22.1" \
+  && test "$(node --version)" = "v26.13.0" \
   && npm --version
 
 WORKDIR /app
