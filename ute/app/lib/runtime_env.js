@@ -3,7 +3,8 @@
 const fs = require('fs-extra');
 const path = require('path');
 
-require('dotenv').config();
+// quiet: dotenv 17+ logs a line per load unless told otherwise.
+require('dotenv').config({ quiet: true });
 
 const APP_ROOT = path.resolve(__dirname, '..');
 const ADDON_OPTIONS_PATH = '/data/options.json';

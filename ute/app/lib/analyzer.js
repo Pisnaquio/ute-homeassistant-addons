@@ -1,5 +1,6 @@
 const Table = require('cli-table3');
-const chalk = require('chalk');
+// chalk 6 is ESM-only; require() of an ES module returns its namespace.
+const chalk = require('chalk').default;
 
 class DataAnalyzer {
   constructor(data = []) {
