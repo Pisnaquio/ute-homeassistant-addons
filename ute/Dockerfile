@@ -1,7 +1,7 @@
 # Node.js comes from the official image instead of Alpine's nodejs package:
 # Alpine 3.24 only packages 24.18.1, without the 2026-10-20 security fixes.
 # The version is asserted below so a changed tag cannot slip in unnoticed.
-FROM node:26.13.0-alpine3.24@sha256:8996bb5821d62a8fd9bb27c1cb07462f3fdce6e47d640c6a881ead0b064ce216 AS node
+FROM node:26.13.1-alpine3.24@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS node
 
 FROM ghcr.io/home-assistant/base:latest
 
